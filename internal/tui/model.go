@@ -423,8 +423,13 @@ func handleKeyUp(m Model) (Model, tea.Cmd, bool) {
 		}
 		m.updateViewportContent()
 		m.ensureCursorVisible()
-	} else {
+	} else if m.cursorLineVisible() {
 		m.viewport.SetYOffset(m.viewport.YOffset - 1)
+	} else {
+		// Already at the first item, but the mouse wheel scrolled the
+		// view away from it — snap back rather than nudging one line at
+		// a time toward a cursor that isn't going to move.
+		m.ensureCursorVisible()
 	}
 	return m, nil, true
 }
@@ -436,8 +441,10 @@ func (m Model) handleSearchArrowUp() Model {
 		m.blockCursor = -1
 		m.updateViewportContent()
 		m.ensureCursorVisible()
-	} else {
+	} else if m.cursorLineVisible() {
 		m.viewport.SetYOffset(m.viewport.YOffset - 1)
+	} else {
+		m.ensureCursorVisible()
 	}
 	return m
 }
@@ -450,8 +457,10 @@ func (m Model) handleSearchArrowDown() Model {
 		m.blockCursor = -1
 		m.updateViewportContent()
 		m.ensureCursorVisible()
-	} else {
+	} else if m.cursorLineVisible() {
 		m.viewport.SetYOffset(m.viewport.YOffset + 1)
+	} else {
+		m.ensureCursorVisible()
 	}
 	return m
 }
@@ -470,8 +479,13 @@ func handleKeyDown(m Model) (Model, tea.Cmd, bool) {
 		m.blockCursor = -1
 		m.updateViewportContent()
 		m.ensureCursorVisible()
-	} else {
+	} else if m.cursorLineVisible() {
 		m.viewport.SetYOffset(m.viewport.YOffset + 1)
+	} else {
+		// Already at the last item, but the mouse wheel scrolled the
+		// view away from it — snap back rather than nudging one line at
+		// a time toward a cursor that isn't going to move.
+		m.ensureCursorVisible()
 	}
 	return m, nil, true
 }
@@ -1113,6 +1127,25 @@ func (m *Model) ensureCursorVisible() {
 		}
 		m.viewport.SetYOffset(newOffset)
 	}
+}
+
+// cursorLineVisible reports whether the current selection is already
+// within the viewport's visible line range. Used at list boundaries
+// (cursor already on the first/last item) to distinguish "the mouse
+// wheel scrolled the view away from the cursor, so this boundary
+// keypress should snap back to it" from "the view is already where the
+// cursor is, so this keypress means free-scroll past the edge."
+func (m *Model) cursorLineVisible() bool {
+	if !m.ready || m.cursor < 0 || m.cursor >= len(m.resourceLineStarts) {
+		return true
+	}
+	lineNum := m.selectedLineStart
+	if lineNum < 0 {
+		lineNum = m.resourceLineStarts[m.cursor]
+	}
+	topLine := m.viewport.YOffset
+	bottomLine := topLine + m.viewport.Height - 1
+	return lineNum >= topLine && lineNum <= bottomLine
 }
 
 // scrollForExpanded ensures the cursor is visible and, when expanded,
