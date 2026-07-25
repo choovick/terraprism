@@ -8,7 +8,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/CaptShanks/terraprism/internal/parser"
+	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
 
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -17,12 +17,38 @@ func stripRenderANSI(s string) string {
 	return ansiPattern.ReplaceAllString(s, "")
 }
 
-func renderExpandedForTest(r parser.Resource, lines []string) string {
-	return renderExpandedWithDiffContextForTest(r, lines, 0)
+// leaf builds a scalar attribute for tests. Path is left empty; use
+// withPaths to fill in Path for a whole tree before rendering.
+func leaf(name string, action tfplan.Action, kind tfplan.ValueKind, old, new any) tfplan.Attribute {
+	return tfplan.Attribute{Name: name, Kind: kind, Action: action, Old: old, New: new}
 }
 
-func renderExpandedWithDiffContextForTest(r parser.Resource, lines []string, diffContext int) string {
-	r.RawLines = append([]string{`  ~ resource "test" "example" {`}, lines...)
+// mapBlock builds a map-kind container attribute for tests.
+func mapBlock(name string, action tfplan.Action, children ...tfplan.Attribute) tfplan.Attribute {
+	return tfplan.Attribute{Name: name, Kind: tfplan.KindMap, Action: action, Children: children}
+}
+
+// withPaths recursively fills in Path (dotted, matching tfplan's real
+// convert.go convention) for a hand-built attribute tree, so tests can
+// construct trees by nesting literals without computing paths by hand.
+func withPaths(attrs []tfplan.Attribute, parent string) []tfplan.Attribute {
+	out := make([]tfplan.Attribute, len(attrs))
+	for i, a := range attrs {
+		path := a.Name
+		if parent != "" {
+			path = parent + "." + a.Name
+		}
+		a.Path = path
+		a.Children = withPaths(a.Children, path)
+		out[i] = a
+	}
+	return out
+}
+
+// renderResourceForTest renders a resource's attribute tree the way
+// Model.renderAttributeTree does when the resource is expanded, with a
+// fresh Model (no cursor/fold overrides beyond what the caller sets on r).
+func renderResourceForTest(r tfplan.Resource, diffContext int) string {
 	m := Model{
 		viewport:     viewport.New(120, 40),
 		foldedBlocks: make(map[string]bool),
@@ -30,217 +56,130 @@ func renderExpandedWithDiffContextForTest(r parser.Resource, lines []string, dif
 		diffContext:  diffContext,
 	}
 	var b strings.Builder
+	foldIdx := 0
 	lineCount := 0
-	m.renderExpandedContent(&b, r, false, &lineCount)
+	m.renderAttributeTree(&b, r.Address, r.Attributes, 0, true, false, &foldIdx, &lineCount)
 	return stripRenderANSI(b.String())
 }
 
-func renderedHasLine(rendered, line string) bool {
-	for _, renderedLine := range strings.Split(rendered, "\n") {
-		if renderedLine == line {
-			return true
-		}
-	}
-	return false
-}
-
-func TestRenderHeredocPreservesYAMLListIndentation(t *testing.T) {
-	r := parser.Resource{Type: "kubectl_manifest", Action: parser.ActionUpdate}
-	lines := []string{
-		`      ~ yaml_body_parsed = <<-EOT`,
-		`            spec:`,
-		`              affinity:`,
-		`                nodeAffinity:`,
-		`                  requiredDuringSchedulingIgnoredDuringExecution:`,
-		`                    nodeSelectorTerms:`,
-		`                    - matchExpressions:`,
-		`                      - key: dedicated`,
-		`                        operator: In`,
-		`                        values:`,
-		`                        - utility`,
-		`        EOT`,
+// Terraform's JSON plan carries the resource's full before/after state,
+// so a partially-changed resource has mostly-unchanged attributes mixed
+// in with the real diff. Rendering every one of them individually — even
+// muted — buried the actual change, so unchanged runs collapse into a
+// single "# (N unchanged attributes hidden)" note instead, matching
+// Terraform CLI's own convention.
+func TestUnchangedAttributesCollapseIntoHiddenCountNote(t *testing.T) {
+	r := tfplan.Resource{
+		Address: "kubectl_manifest.example",
+		Action:  tfplan.ActionUpdate,
+		Attributes: withPaths([]tfplan.Attribute{
+			leaf("api_version", tfplan.ActionNoOp, tfplan.KindString, "v1", "v1"),
+			leaf("force_conflicts", tfplan.ActionNoOp, tfplan.KindBool, false, false),
+			leaf("live_uid", tfplan.ActionNoOp, tfplan.KindString, "abc-123", "abc-123"),
+			leaf("wait_for_rollout", tfplan.ActionUpdate, tfplan.KindBool, false, true),
+			leaf("timeouts", tfplan.ActionNoOp, tfplan.KindNull, nil, nil),
+		}, ""),
 	}
 
-	got := renderExpandedForTest(r, lines)
+	got := renderResourceForTest(r, 0)
 
-	for _, want := range []string{
-		`                    - matchExpressions:`,
-		`                      - key: dedicated`,
-		`                        - utility`,
-	} {
-		if !renderedHasLine(got, want) {
-			t.Fatalf("rendered heredoc missing correctly indented line %q:\n%s", want, got)
-		}
+	if !strings.Contains(got, "# (3 unchanged attributes hidden)") {
+		t.Fatalf("expected a single hidden-count note for the leading run of 3 unchanged attributes:\n%s", got)
 	}
-	if renderedHasLine(got, `                  - matchExpressions:`) {
-		t.Fatalf("rendered heredoc shifted YAML list indentation left:\n%s", got)
+	if strings.Contains(got, "api_version") || strings.Contains(got, "force_conflicts") || strings.Contains(got, "live_uid") {
+		t.Fatalf("unchanged attribute names should not be rendered individually:\n%s", got)
 	}
-}
-
-func TestRenderHeredocPreservesTerraformDiffPrefixColumn(t *testing.T) {
-	r := parser.Resource{Type: "kubectl_manifest", Action: parser.ActionUpdate}
-	lines := []string{
-		`      ~ yaml_body_parsed = <<-EOT`,
-		`            spec:`,
-		`              remoteWrite:`,
-		`              - url: http://internal-write-endpoint.example.local/api/v1/write`,
-		`              - url: http://external-write-endpoint.example.com/api/v1/write`,
-		`          +   - url: http://external-write-endpoint.example.com/api/v1/write`,
-		`        EOT`,
+	if !strings.Contains(got, "wait_for_rollout") {
+		t.Fatalf("expected the actually-changed attribute to still render:\n%s", got)
 	}
-
-	got := renderExpandedForTest(r, lines)
-	want := `          +   - url: http://external-write-endpoint.example.com/api/v1/write`
-	if !strings.Contains(got, want) {
-		t.Fatalf("rendered heredoc missing Terraform diff-prefixed YAML line %q:\n%s", want, got)
+	if !strings.Contains(got, "# (1 unchanged attribute hidden)") {
+		t.Fatalf("expected a singular-noun hidden-count note for the trailing run of 1:\n%s", got)
 	}
 }
 
 func TestRenderGenericLargeBlockCollapsesByDefault(t *testing.T) {
-	r := parser.Resource{Type: "helm_release", Address: "helm_release.chart", Action: parser.ActionUpdate}
-	lines := []string{
-		`      ~ metadata                   = {`,
-		`          ~ app_version    = "v1.132.0" -> (known after apply)`,
-		`          ~ chart          = "example-chart" -> (known after apply)`,
-		`          ~ first_deployed = 1770864889 -> (known after apply)`,
-		`          ~ notes          = <<-EOT`,
-		`                1. Get the application URL by running these commands:`,
-		`                  export POD_NAME=$(kubectl get pods --namespace victoria-metrics)`,
-		`            EOT -> (known after apply)`,
-		`          ~ values         = jsonencode(`,
-		`                {`,
-	}
+	children := make([]tfplan.Attribute, 0, 35)
 	for i := 0; i < 35; i++ {
-		lines = append(lines, `                  key = "value"`)
+		children = append(children, leaf("key"+string(rune('a'+i%26)), tfplan.ActionNoOp, tfplan.KindString, "value", "value"))
 	}
-	lines = append(lines,
-		`                }`,
-		`            ) -> (known after apply)`,
-		`        }`,
-		`      ~ values = [`,
-		`          - <<-EOT`,
-		`              controller:`,
-		`                replicaCount: 2`,
-		`            EOT,`,
-		`          + <<-EOT`,
-		`              controller:`,
-		`                replicaCount: 3`,
-		`            EOT,`,
-		`        ]`,
+	metadata := mapBlock("metadata", tfplan.ActionUpdate, children...)
+	values := leaf("values", tfplan.ActionUpdate, tfplan.KindString,
+		"controller:\n  replicaCount: 2\n",
+		"controller:\n  replicaCount: 3\n",
 	)
 
-	r.RawLines = append([]string{`  ~ resource "test" "example" {`}, lines...)
-	blocks := findFoldBlocks(r, r.RawLines[1:])
-	foundValuesFold := false
-	for _, block := range blocks {
-		if strings.Contains(r.RawLines[block.Start+1], `values = [`) {
-			foundValuesFold = true
-			break
-		}
-	}
-	if !foundValuesFold {
-		t.Fatalf("expected top-level values list to be foldable, got %#v", blocks)
+	r := tfplan.Resource{
+		Address:    "helm_release.chart",
+		Type:       "helm_release",
+		Action:     tfplan.ActionUpdate,
+		Attributes: withPaths([]tfplan.Attribute{metadata, values}, ""),
 	}
 
-	got := renderExpandedForTest(r, lines)
+	got := renderResourceForTest(r, 0)
 
-	for _, want := range []string{
-		`      ▶ ~ metadata                   = { ... (47 lines)`,
-		`      ▼ ~ values = [`,
-		`          ▼ ~ heredoc diff <<-EOT (2 → 2 lines)`,
-		`replicaCount: 2`,
-		`replicaCount: 3`,
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("rendered helm release missing %q:\n%s", want, got)
-		}
+	if !strings.Contains(got, "▶ ~ metadata = { ... 35 attrs }") {
+		t.Fatalf("expected metadata block to collapse by default:\n%s", got)
 	}
-	for _, hidden := range []string{`app_version`, `Get the application URL`, `key = "value"`} {
-		if strings.Contains(got, hidden) {
-			t.Fatalf("rendered plan still contains collapsed block content %q:\n%s", hidden, got)
-		}
+	if strings.Contains(got, "keya") {
+		t.Fatalf("collapsed block content should be hidden:\n%s", got)
 	}
-	for _, separate := range []string{`          ▶ - <<-EOT`, `          ▶ + <<-EOT`, `          ▼ - <<-EOT`, `          ▼ + <<-EOT`} {
-		if strings.Contains(got, separate) {
-			t.Fatalf("rendered plan still contains separate heredoc fold %q:\n%s", separate, got)
-		}
+	if !strings.Contains(got, "replicaCount: 2") || !strings.Contains(got, "replicaCount: 3") {
+		t.Fatalf("expected multiline string diff to show both sides:\n%s", got)
 	}
 }
 
-func TestPairedHeredocsUseSingleDiffFold(t *testing.T) {
-	r := parser.Resource{
+// A changed multi-line string is structurally a single Attribute with one
+// Old and one New value — there's no "pairing" step needed the way the old
+// heredoc-marker text parser needed to pair a removed block with an added
+// one, so it always renders as exactly one diff block.
+func TestMultilineStringRendersAsSingleDiffBlock(t *testing.T) {
+	r := tfplan.Resource{
 		Address: "helm_release.chart",
-		Action:  parser.ActionUpdate,
-		RawLines: []string{
-			`  ~ resource "helm_release" "chart" {`,
-			`      ~ values = [`,
-			`          - <<-EOT`,
-			`              controller:`,
-			`                replicaCount: 2`,
-			`            EOT,`,
-			`          + <<-EOT`,
-			`              controller:`,
-			`                replicaCount: 3`,
-			`            EOT,`,
-			`        ]`,
-		},
+		Action:  tfplan.ActionUpdate,
+		Attributes: withPaths([]tfplan.Attribute{
+			leaf("values", tfplan.ActionUpdate, tfplan.KindString,
+				"controller:\n  replicaCount: 2\n",
+				"controller:\n  replicaCount: 3\n"),
+		}, ""),
 	}
 
-	blocks := findFoldBlocks(r, r.RawLines[1:])
-	if len(blocks) != 2 {
-		t.Fatalf("expected values fold and heredoc diff fold, got %#v", blocks)
+	got := renderResourceForTest(r, 0)
+	if count := strings.Count(got, "<<EOT"); count != 1 {
+		t.Fatalf("expected exactly one multiline diff block, got %d:\n%s", count, got)
 	}
-	if !blocks[1].HeredocPair {
-		t.Fatalf("expected second fold to be paired heredoc diff, got %#v", blocks[1])
-	}
-
-	got := renderExpandedForTest(r, r.RawLines[1:])
-	if !strings.Contains(got, `▼ ~ heredoc diff <<-EOT (2 → 2 lines)`) {
-		t.Fatalf("rendered plan missing combined heredoc diff fold:\n%s", got)
-	}
-	if strings.Contains(got, `▼ - <<-EOT`) || strings.Contains(got, `▼ + <<-EOT`) {
-		t.Fatalf("rendered plan contains separate heredoc folds:\n%s", got)
+	if !strings.Contains(got, "replicaCount: 2") || !strings.Contains(got, "replicaCount: 3") {
+		t.Fatalf("expected both old and new content visible:\n%s", got)
 	}
 }
 
-func TestDiffContextControlsHeredocContextLines(t *testing.T) {
-	r := parser.Resource{
-		Address: "helm_release.chart",
-		Action:  parser.ActionUpdate,
-	}
-	lines := []string{
-		`      ~ values = [`,
-		`          - <<-EOT`,
-		`              before-a: true`,
-		`              before-b: true`,
-		`              before-c: true`,
-		`              target: old`,
-		`              after-a: true`,
-		`              after-b: true`,
-		`              after-c: true`,
-		`            EOT,`,
-		`          + <<-EOT`,
-		`              before-a: true`,
-		`              before-b: true`,
-		`              before-c: true`,
-		`              target: new`,
-		`              after-a: true`,
-		`              after-b: true`,
-		`              after-c: true`,
-		`            EOT,`,
-		`        ]`,
+func TestDiffContextControlsMultilineContextLines(t *testing.T) {
+	oldVal := strings.Join([]string{
+		"before-a: true", "before-b: true", "before-c: true",
+		"target: old",
+		"after-a: true", "after-b: true", "after-c: true",
+	}, "\n")
+	newVal := strings.Join([]string{
+		"before-a: true", "before-b: true", "before-c: true",
+		"target: new",
+		"after-a: true", "after-b: true", "after-c: true",
+	}, "\n")
+
+	r := tfplan.Resource{
+		Address:    "helm_release.chart",
+		Action:     tfplan.ActionUpdate,
+		Attributes: withPaths([]tfplan.Attribute{leaf("values", tfplan.ActionUpdate, tfplan.KindString, oldVal, newVal)}, ""),
 	}
 
-	withoutContext := renderExpandedWithDiffContextForTest(r, lines, 0)
-	if strings.Contains(withoutContext, `before-a: true`) || strings.Contains(withoutContext, `after-c: true`) {
+	withoutContext := renderResourceForTest(r, 0)
+	if strings.Contains(withoutContext, "before-a: true") || strings.Contains(withoutContext, "after-c: true") {
 		t.Fatalf("expected zero diff context to hide far context lines:\n%s", withoutContext)
 	}
-	if !strings.Contains(withoutContext, `target: old`) || !strings.Contains(withoutContext, `target: new`) {
+	if !strings.Contains(withoutContext, "target: old") || !strings.Contains(withoutContext, "target: new") {
 		t.Fatalf("expected changed lines to remain visible with zero context:\n%s", withoutContext)
 	}
 
-	withContext := renderExpandedWithDiffContextForTest(r, lines, 3)
-	for _, want := range []string{`before-a: true`, `before-b: true`, `before-c: true`, `after-a: true`, `after-b: true`, `after-c: true`} {
+	withContext := renderResourceForTest(r, 3)
+	for _, want := range []string{"before-a: true", "before-b: true", "before-c: true", "after-a: true", "after-b: true", "after-c: true"} {
 		if !strings.Contains(withContext, want) {
 			t.Fatalf("expected expanded diff context to include %q:\n%s", want, withContext)
 		}
@@ -249,7 +188,7 @@ func TestDiffContextControlsHeredocContextLines(t *testing.T) {
 
 func TestDiffContextHotkeysClampContext(t *testing.T) {
 	m := Model{
-		plan:        &parser.Plan{},
+		plan:        &tfplan.Plan{},
 		viewport:    viewport.New(80, 20),
 		diffContext: defaultDiffContext,
 	}
@@ -277,26 +216,28 @@ func TestDiffContextHotkeysClampContext(t *testing.T) {
 	}
 }
 
-func TestVisibleFoldBlocksExcludesChildrenOfCollapsedParent(t *testing.T) {
-	r := parser.Resource{
-		Address: "helm_release.chart",
-		Action:  parser.ActionUpdate,
-		RawLines: []string{
-			`  ~ resource "helm_release" "chart" {`,
-			`      ~ metadata = {`,
-			`          ~ values = {`,
-			`              nested = true`,
-			`            }`,
-			`        }`,
-		},
+// nestedMetadataResource builds a resource with a two-level-deep fold
+// tree: metadata { values { nested = true } }.
+func nestedMetadataResource() tfplan.Resource {
+	nested := leaf("nested", tfplan.ActionUpdate, tfplan.KindBool, false, true)
+	values := mapBlock("values", tfplan.ActionUpdate, nested)
+	metadata := mapBlock("metadata", tfplan.ActionUpdate, values)
+	return tfplan.Resource{
+		Address:    "helm_release.chart",
+		Action:     tfplan.ActionUpdate,
+		Attributes: withPaths([]tfplan.Attribute{metadata}, ""),
 	}
+}
+
+func TestVisibleFoldBlocksExcludesChildrenOfCollapsedParent(t *testing.T) {
+	r := nestedMetadataResource()
 	m := Model{
-		plan:         &parser.Plan{Resources: []parser.Resource{r}},
+		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
 		expanded:     map[int]bool{0: true},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  -1,
 	}
-	blocks := findFoldBlocks(r, r.RawLines[1:])
+	blocks := allFoldableAttributes(r.Address, r.Attributes, 0)
 	if len(blocks) != 2 {
 		t.Fatalf("expected parent and child folds, got %d", len(blocks))
 	}
@@ -312,20 +253,9 @@ func TestVisibleFoldBlocksExcludesChildrenOfCollapsedParent(t *testing.T) {
 }
 
 func TestVisibleFoldBlocksIncludesChildrenOfExpandedParent(t *testing.T) {
-	r := parser.Resource{
-		Address: "helm_release.chart",
-		Action:  parser.ActionUpdate,
-		RawLines: []string{
-			`  ~ resource "helm_release" "chart" {`,
-			`      ~ metadata = {`,
-			`          ~ values = {`,
-			`              nested = true`,
-			`            }`,
-			`        }`,
-		},
-	}
+	r := nestedMetadataResource()
 	m := Model{
-		plan:         &parser.Plan{Resources: []parser.Resource{r}},
+		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
 		expanded:     map[int]bool{0: true},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  -1,
@@ -335,26 +265,15 @@ func TestVisibleFoldBlocksIncludesChildrenOfExpandedParent(t *testing.T) {
 	if len(visible) != 2 {
 		t.Fatalf("expected parent and child folds to be visible, got %d", len(visible))
 	}
-	if visible[0].Start != 0 || visible[1].Start != 1 {
+	if visible[0].Path != "metadata" || visible[1].Path != "metadata.values" {
 		t.Fatalf("unexpected visible fold order: %#v", visible)
 	}
 }
 
 func TestSetCurrentScopeFoldsCollapsedResourceScope(t *testing.T) {
-	r := parser.Resource{
-		Address: "helm_release.chart",
-		Action:  parser.ActionUpdate,
-		RawLines: []string{
-			`  ~ resource "helm_release" "chart" {`,
-			`      ~ metadata = {`,
-			`          ~ values = {`,
-			`              nested = true`,
-			`            }`,
-			`        }`,
-		},
-	}
+	r := nestedMetadataResource()
 	m := Model{
-		plan:         &parser.Plan{Resources: []parser.Resource{r}},
+		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
 		expanded:     map[int]bool{0: true},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  -1,
@@ -363,7 +282,7 @@ func TestSetCurrentScopeFoldsCollapsedResourceScope(t *testing.T) {
 	if !m.setCurrentScopeFoldsCollapsed(true) {
 		t.Fatal("expected resource-scope collapse to apply")
 	}
-	for _, block := range findFoldBlocks(r, r.RawLines[1:]) {
+	for _, block := range allFoldableAttributes(r.Address, r.Attributes, 0) {
 		if !m.foldedBlocks[block.Key] {
 			t.Fatalf("expected fold %q to be collapsed", block.Key)
 		}
@@ -372,7 +291,7 @@ func TestSetCurrentScopeFoldsCollapsedResourceScope(t *testing.T) {
 	if !m.setCurrentScopeFoldsCollapsed(false) {
 		t.Fatal("expected resource-scope expand to apply")
 	}
-	for _, block := range findFoldBlocks(r, r.RawLines[1:]) {
+	for _, block := range allFoldableAttributes(r.Address, r.Attributes, 0) {
 		if m.foldedBlocks[block.Key] {
 			t.Fatalf("expected fold %q to be expanded", block.Key)
 		}
@@ -380,28 +299,22 @@ func TestSetCurrentScopeFoldsCollapsedResourceScope(t *testing.T) {
 }
 
 func TestSetCurrentScopeFoldsCollapsedSubBlockScope(t *testing.T) {
-	r := parser.Resource{
-		Address: "helm_release.chart",
-		Action:  parser.ActionUpdate,
-		RawLines: []string{
-			`  ~ resource "helm_release" "chart" {`,
-			`      ~ metadata = {`,
-			`          ~ values = {`,
-			`              nested = true`,
-			`            }`,
-			`        }`,
-			`      ~ set = {`,
-			`          value = true`,
-			`        }`,
-		},
+	nested := leaf("nested", tfplan.ActionUpdate, tfplan.KindBool, false, true)
+	values := mapBlock("values", tfplan.ActionUpdate, nested)
+	metadata := mapBlock("metadata", tfplan.ActionUpdate, values)
+	set := mapBlock("set", tfplan.ActionUpdate, leaf("value", tfplan.ActionUpdate, tfplan.KindBool, false, true))
+	r := tfplan.Resource{
+		Address:    "helm_release.chart",
+		Action:     tfplan.ActionUpdate,
+		Attributes: withPaths([]tfplan.Attribute{metadata, set}, ""),
 	}
 	m := Model{
-		plan:         &parser.Plan{Resources: []parser.Resource{r}},
+		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
 		expanded:     map[int]bool{0: true},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  0,
 	}
-	blocks := findFoldBlocks(r, r.RawLines[1:])
+	blocks := allFoldableAttributes(r.Address, r.Attributes, 0)
 	if len(blocks) != 3 {
 		t.Fatalf("expected metadata, values, and set folds, got %#v", blocks)
 	}
@@ -418,33 +331,24 @@ func TestSetCurrentScopeFoldsCollapsedSubBlockScope(t *testing.T) {
 }
 
 func TestExpandAndCollapseEverythingAffectsAllDisplayedResourcesAndFolds(t *testing.T) {
-	resources := []parser.Resource{
+	metadata := mapBlock("metadata", tfplan.ActionUpdate,
+		mapBlock("values", tfplan.ActionUpdate, leaf("nested", tfplan.ActionUpdate, tfplan.KindBool, false, true)))
+	spec := mapBlock("spec", tfplan.ActionUpdate, leaf("replicas", tfplan.ActionUpdate, tfplan.KindNumber, "2", "3"))
+
+	resources := []tfplan.Resource{
 		{
-			Address: "helm_release.chart",
-			Action:  parser.ActionUpdate,
-			RawLines: []string{
-				`  ~ resource "helm_release" "chart" {`,
-				`      ~ metadata = {`,
-				`          ~ values = {`,
-				`              nested = true`,
-				`            }`,
-				`        }`,
-			},
+			Address:    "helm_release.chart",
+			Action:     tfplan.ActionUpdate,
+			Attributes: withPaths([]tfplan.Attribute{metadata}, ""),
 		},
 		{
-			Address: "kubectl_manifest.vmagent",
-			Action:  parser.ActionUpdate,
-			RawLines: []string{
-				`  ~ resource "kubectl_manifest" "vmagent" {`,
-				`      ~ yaml_body_parsed = <<-EOT`,
-				`            spec:`,
-				`              replicas: 3`,
-				`        EOT`,
-			},
+			Address:    "kubectl_manifest.vmagent",
+			Action:     tfplan.ActionUpdate,
+			Attributes: withPaths([]tfplan.Attribute{spec}, ""),
 		},
 	}
 	m := Model{
-		plan:         &parser.Plan{Resources: resources},
+		plan:         &tfplan.Plan{Resources: resources},
 		expanded:     map[int]bool{0: false, 1: false},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  1,
@@ -455,7 +359,7 @@ func TestExpandAndCollapseEverythingAffectsAllDisplayedResourcesAndFolds(t *test
 		if !m.expanded[idx] {
 			t.Fatalf("expected resource %d to be expanded", idx)
 		}
-		for _, block := range findFoldBlocks(resources[idx], resources[idx].RawLines[1:]) {
+		for _, block := range allFoldableAttributes(resources[idx].Address, resources[idx].Attributes, 0) {
 			if m.foldedBlocks[block.Key] {
 				t.Fatalf("expected fold %q to be expanded", block.Key)
 			}
@@ -470,7 +374,7 @@ func TestExpandAndCollapseEverythingAffectsAllDisplayedResourcesAndFolds(t *test
 		if m.expanded[idx] {
 			t.Fatalf("expected resource %d to be collapsed", idx)
 		}
-		for _, block := range findFoldBlocks(resources[idx], resources[idx].RawLines[1:]) {
+		for _, block := range allFoldableAttributes(resources[idx].Address, resources[idx].Attributes, 0) {
 			if !m.foldedBlocks[block.Key] {
 				t.Fatalf("expected fold %q to be collapsed", block.Key)
 			}

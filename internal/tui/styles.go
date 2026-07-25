@@ -92,6 +92,7 @@ var (
 	updateSymbol       string
 	replaceSymbol      string
 	readSymbol         string
+	forgetSymbol       string
 	expandedIndicator  string
 	collapsedIndicator string
 )
@@ -158,6 +159,7 @@ func initStyles() {
 	updateSymbol = lipgloss.NewStyle().Foreground(updateColor).Render("~")
 	replaceSymbol = lipgloss.NewStyle().Foreground(replaceColor).Render("±")
 	readSymbol = lipgloss.NewStyle().Foreground(readColor).Render("≤")
+	forgetSymbol = lipgloss.NewStyle().Foreground(mutedColorVal).Render("⊘")
 
 	// Expand/collapse indicators
 	expandedIndicator = lipgloss.NewStyle().Foreground(mutedColorVal).Render("▼")
@@ -185,14 +187,16 @@ func GetActionSymbol(action string) string {
 	switch action {
 	case "create":
 		return createSymbol
-	case "destroy":
+	case "delete":
 		return destroySymbol
 	case "update":
 		return updateSymbol
-	case "replace", "delete-create", "create-delete":
+	case "replace":
 		return replaceSymbol
 	case "read":
 		return readSymbol
+	case "forget":
+		return forgetSymbol
 	case "output":
 		return updateSymbol
 	default:
@@ -205,13 +209,13 @@ func GetResourceStyle(action string) lipgloss.Style {
 	switch action {
 	case "create":
 		return resourceCreateStyle
-	case "destroy":
+	case "delete":
 		return resourceDestroyStyle
 	case "update":
 		return resourceUpdateStyle
-	case "replace", "delete-create", "create-delete":
+	case "replace":
 		return resourceReplaceStyle
-	case "read":
+	case "read", "forget":
 		return resourceReadStyle
 	case "output":
 		return resourceUpdateStyle
@@ -225,13 +229,13 @@ func GetActionColor(action string) lipgloss.Color {
 	switch action {
 	case "create":
 		return createColor
-	case "destroy":
+	case "delete":
 		return destroyColor
 	case "update":
 		return updateColor
-	case "replace", "delete-create", "create-delete":
+	case "replace":
 		return replaceColor
-	case "read":
+	case "read", "forget":
 		return readColor
 	case "output":
 		return updateColor

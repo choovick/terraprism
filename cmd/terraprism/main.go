@@ -1,16 +1,20 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/CaptShanks/terraprism/internal/history"
-	"github.com/CaptShanks/terraprism/internal/parser"
+	"github.com/CaptShanks/terraprism/internal/runner"
+	"github.com/CaptShanks/terraprism/internal/tfplan"
 	"github.com/CaptShanks/terraprism/internal/tui"
 	"github.com/CaptShanks/terraprism/internal/updater"
 
@@ -138,30 +142,33 @@ func ensureDestroyFlag(tfArgs []string) []string {
 	return append([]string{"-destroy"}, tfArgs...)
 }
 
-func runApplyExecute(tfCmd, planFile, historyPath string) error {
-	if historyPath != "" {
-		_ = history.AppendToHistoryFile(historyPath, "\n\n--- APPLY OUTPUT ---\n\n")
-	}
-	applyCmd := exec.Command(tfCmd, "apply", planFile)
-	applyCmd.Stdout = os.Stdout
-	applyCmd.Stderr = os.Stderr
-	applyCmd.Stdin = os.Stdin
-	return applyCmd.Run()
-}
-
-func updateHistoryApplyResult(historyPath string, success bool, applyErr error) {
+func updateHistoryApplyResult(historyPath string, success bool) {
 	if historyPath == "" {
 		return
 	}
-	if success {
-		footer := history.CreateApplyResultFooter(true, nil)
-		_ = history.AppendToHistoryFile(historyPath, footer)
-		_, _ = history.UpdateFilenameWithStatus(historyPath, history.StatusSuccess)
-	} else {
-		footer := history.CreateApplyResultFooter(false, applyErr)
-		_ = history.AppendToHistoryFile(historyPath, footer)
-		_, _ = history.UpdateFilenameWithStatus(historyPath, history.StatusFailed)
+	status := history.StatusSuccess
+	if !success {
+		status = history.StatusFailed
 	}
+	_, _ = history.UpdateFilenameWithStatus(historyPath, status)
+}
+
+func saveHistory(commandName, tfCmd string, tfArgs []string, rawJSON []byte) string {
+	meta := history.Meta{
+		Timestamp:  time.Now(),
+		Command:    commandName,
+		TFCommand:  tfCmd,
+		Args:       tfArgs,
+		WorkingDir: history.GetFullWorkingDir(),
+	}
+	historyPath, err := history.CreateHistoryFile(commandName, meta, rawJSON)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to save history: %v\n", err)
+	}
+	if deleted, _ := history.CleanupOldFiles(); deleted > 0 {
+		fmt.Fprintf(os.Stderr, "Cleaned up %d old history files\n", deleted)
+	}
+	return historyPath
 }
 
 // runApplyMode runs terraform/tofu plan, shows TUI, and optionally applies
@@ -174,34 +181,27 @@ func runApplyMode(args []string, isDestroy bool) {
 		tfArgs = ensureDestroyFlag(tfArgs)
 	}
 
-	planFile := filepath.Join(os.TempDir(), fmt.Sprintf("terraprism-%d.tfplan", os.Getpid()))
-	defer os.Remove(planFile)
+	ctx := context.Background()
 
 	fmt.Printf("Terra-Prism: Running %s plan... ", tfCmd)
-	planArgs := append([]string{"plan", "-out=" + planFile, "-no-color"}, tfArgs...)
-	output, err := exec.Command(tfCmd, planArgs...).CombinedOutput()
+	result, err := runner.RunPlan(ctx, runner.Options{
+		Cmd:          runner.TFCommand(tfCmd),
+		Args:         tfArgs,
+		KeepPlanFile: true,
+	})
 	if err != nil {
 		fmt.Println("FAILED")
-		fmt.Fprintf(os.Stderr, "\n%s plan failed:\n%s\n", tfCmd, string(output))
+		reportRunError(tfCmd, err)
 		os.Exit(1)
 	}
+	planFile := result.PlanFile
+	defer os.Remove(planFile)
 	fmt.Println("OK")
 
-	historyHeader := history.CreateHistoryHeader("plan", tfCmd, tfArgs)
-	historyPath, historyErr := history.CreateHistoryFile(commandName, historyHeader+string(output))
-	if historyErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Failed to save history: %v\n", historyErr)
-	}
-	if deleted, _ := history.CleanupOldFiles(); deleted > 0 {
-		fmt.Fprintf(os.Stderr, "Cleaned up %d old history files\n", deleted)
-	}
+	historyPath := saveHistory(commandName, tfCmd, tfArgs, result.RawJSON)
 
-	plan, err := parser.Parse(string(output))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing plan: %v\n", err)
-		os.Exit(1)
-	}
-	if len(plan.Resources) == 0 {
+	plan := result.Plan
+	if len(plan.DisplayResources()) == 0 {
 		fmt.Println("No changes. Infrastructure is up-to-date.")
 		if historyPath != "" {
 			_, _ = history.UpdateFilenameWithStatus(historyPath, "nochanges")
@@ -219,20 +219,31 @@ func runApplyMode(args []string, isDestroy bool) {
 
 	if m, ok := finalModel.(tui.Model); ok && m.ShouldApply() {
 		fmt.Printf("\nApplying plan with %s...\n\n", tfCmd)
-		applyErr := runApplyExecute(tfCmd, planFile, historyPath)
+		applyErr := runner.Apply(ctx, runner.TFCommand(tfCmd), planFile)
 		if applyErr != nil {
 			fmt.Fprintf(os.Stderr, "\nApply failed: %v\n", applyErr)
-			updateHistoryApplyResult(historyPath, false, applyErr)
+			updateHistoryApplyResult(historyPath, false)
 			os.Exit(1)
 		}
 		fmt.Println("\nApply complete!")
-		updateHistoryApplyResult(historyPath, true, nil)
+		updateHistoryApplyResult(historyPath, true)
 	} else {
 		fmt.Println("\nApply cancelled.")
 		if historyPath != "" {
 			_, _ = history.UpdateFilenameWithStatus(historyPath, history.StatusCancelled)
 		}
 	}
+}
+
+// reportRunError prints a runner error in a form matching the CLI's own
+// plan/show failure output.
+func reportRunError(tfCmd string, err error) {
+	var planErr *runner.PlanError
+	if errors.As(err, &planErr) {
+		fmt.Fprintf(os.Stderr, "\n%s plan failed:\n%s\n", tfCmd, string(planErr.Output))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\n%v\n", err)
 }
 
 // runPlanMode runs terraform/tofu plan and shows in TUI (read-only)
@@ -256,38 +267,22 @@ func runPlanMode(args []string) {
 
 	fmt.Printf("Terra-Prism: Running %s plan... ", tfCmd)
 
-	planArgs := append([]string{"plan", "-no-color"}, tfArgs...)
-	cmd := exec.Command(tfCmd, planArgs...)
-
-	// Capture both stdout and stderr
-	output, err := cmd.CombinedOutput()
+	result, err := runner.RunPlan(context.Background(), runner.Options{
+		Cmd:  runner.TFCommand(tfCmd),
+		Args: tfArgs,
+	})
 	if err != nil {
 		fmt.Println("FAILED")
-		fmt.Fprintf(os.Stderr, "\n%s plan failed:\n%s\n", tfCmd, string(output))
+		reportRunError(tfCmd, err)
 		os.Exit(1)
 	}
 
 	fmt.Println("OK")
 
-	// Save plan output to history
-	historyHeader := history.CreateHistoryHeader("plan", tfCmd, tfArgs)
-	_, historyErr := history.CreateHistoryFile("plan", historyHeader+string(output))
-	if historyErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Failed to save history: %v\n", historyErr)
-	}
+	saveHistory("plan", tfCmd, tfArgs, result.RawJSON)
 
-	// Cleanup old history files
-	if deleted, _ := history.CleanupOldFiles(); deleted > 0 {
-		fmt.Fprintf(os.Stderr, "Cleaned up %d old history files\n", deleted)
-	}
-
-	plan, err := parser.Parse(string(output))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing plan: %v\n", err)
-		os.Exit(1)
-	}
-
-	if len(plan.Resources) == 0 {
+	plan := result.Plan
+	if len(plan.DisplayResources()) == 0 {
 		fmt.Println("No changes. Infrastructure is up-to-date.")
 		os.Exit(0)
 	}
@@ -481,15 +476,14 @@ func runHistoryView(args []string) {
 		}
 	}
 
-	// Read the file
-	content, err := os.ReadFile(filePath)
+	// Read the history envelope and decode the plan JSON inside it
+	envelope, err := history.ReadEnvelope(filePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error reading history file: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Parse and display in TUI
-	plan, err := parser.Parse(string(content))
+	plan, err := tfplan.DecodeBytes(envelope.Plan)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing plan: %v\n", err)
 		os.Exit(1)
@@ -556,17 +550,15 @@ func clearHistory() {
 
 // detectTFCommand returns "terraform" or "tofu" based on flags and availability
 func detectTFCommand() string {
-	if useTofu {
-		return "tofu"
-	}
-	// Auto-detect: prefer terraform, fall back to tofu
-	if _, err := exec.LookPath("terraform"); err == nil {
-		return "terraform"
-	}
-	if _, err := exec.LookPath("tofu"); err == nil {
-		return "tofu"
-	}
-	return "terraform" // Default, will error if not found
+	return string(runner.DetectCommand(useTofu))
+}
+
+// looksLikeJSON reports whether raw's first non-whitespace byte is '{',
+// distinguishing `terraform show -json` output from plain plan text or a
+// binary `-out=` plan file.
+func looksLikeJSON(raw []byte) bool {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	return len(trimmed) > 0 && trimmed[0] == '{'
 }
 
 // runPassthroughMode runs terraform/tofu with the given args (e.g. init, validate, fmt)
@@ -712,30 +704,27 @@ func runViewMode(args []string) {
 		input = os.Stdin
 	}
 
-	var lines []string
-	scanner := bufio.NewScanner(input)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-
-	if err := scanner.Err(); err != nil {
+	raw, err := io.ReadAll(input)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
 		os.Exit(1)
 	}
 
-	planText := strings.Join(lines, "\n")
+	if !looksLikeJSON(raw) {
+		fmt.Fprintln(os.Stderr, "Error: input does not look like terraform show -json output.")
+		fmt.Fprintln(os.Stderr, "terraprism needs a JSON plan, not plain 'terraform plan' text or a binary plan file. Run:")
+		fmt.Fprintln(os.Stderr, "    terraform plan -out=plan.bin && terraform show -json plan.bin | terraprism")
+		os.Exit(1)
+	}
 
-	plan, err := parser.Parse(planText)
+	plan, err := tfplan.DecodeBytes(raw)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing plan: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(plan.Resources) == 0 {
-		fmt.Println("No resource changes detected in the plan.")
+	if len(plan.DisplayResources()) == 0 {
+		fmt.Println("No changes detected in the plan.")
 		os.Exit(0)
 	}
 
@@ -760,8 +749,9 @@ func printUsage() {
 	fmt.Printf(`terraprism %s - Interactive Terraform/OpenTofu plan viewer
 
 USAGE:
-    terraform plan -no-color | terraprism        # Pipe plan output
-    terraprism <plan-file>                       # Read from file
+    terraform plan -out=plan.bin && terraform show -json plan.bin | terraprism
+                                                  # Pipe JSON plan output
+    terraprism <plan.json>                       # Read a show -json file
     terraprism plan [-- tf-args]                 # Run plan and view
     terraprism apply [-- tf-args]                # Run plan, view, and apply
     terraprism destroy [-- tf-args]              # Run destroy plan and apply
@@ -815,8 +805,8 @@ HISTORY:
     Use 'terraprism history' to list them.
 
 EXAMPLES:
-    # View piped plan
-    terraform plan -no-color | terraprism
+    # View a piped JSON plan
+    terraform plan -out=plan.bin && terraform show -json plan.bin | terraprism
 
     # Run plan and view
     terraprism plan
@@ -903,7 +893,7 @@ EXAMPLES:
     terraprism history view 1            # View most recent entry
     terraprism history view 3            # View 3rd most recent
     terraprism history 1                 # Shorthand for 'view 1'
-    terraprism history view 2025-01-14_10-30-00_plan.txt
+    terraprism history view 2025-01-14_10-30-00_myproj_plan.json
 
 `)
 }

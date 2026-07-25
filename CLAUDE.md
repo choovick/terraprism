@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Terraprism is a terminal UI (TUI) tool that visualizes Terraform plan output in a human-friendly, interactive format. It parses `terraform plan` JSON output and presents resource changes with diffs, filtering, and search capabilities.
+Terraprism is a terminal UI (TUI) tool that visualizes Terraform plan output in a human-friendly, interactive format. It decodes `terraform show -json` plan output and presents resource changes with diffs, filtering, and search capabilities.
 
 - **Tech Stack:** Go 1.24, Charm Bubble Tea, Charm Lipgloss, Charm Bubbles
 - **Module path:** `github.com/CaptShanks/terraprism`
@@ -13,12 +13,11 @@ Terraprism is a terminal UI (TUI) tool that visualizes Terraform plan output in 
 ```
 cmd/terraprism/       Entry point (main.go)
 internal/
-  config/             Configuration management
-  history/            Plan history tracking
-  parser/             Terraform plan JSON parser (core logic)
+  history/            Plan/apply history tracking (JSON envelope files)
+  runner/             Shells out to terraform/tofu plan/show/apply
+  tfplan/             Decodes `terraform show -json` into the tui view model (core logic)
   tui/                Terminal UI components (Bubble Tea model, views, styles)
   updater/            Self-update mechanism via GitHub releases
-testdata/             Sample Terraform plan JSON files for testing
 docs/architecture/    Architecture documents for issues (auto-generated)
 ```
 
@@ -42,7 +41,7 @@ golangci-lint run ./...
 
 - Go standard `testing` package
 - Table-driven tests with subtests (`t.Run`), `t.Parallel()` where safe
-- Test data in `testdata/` directory
+- Test data colocated per-package (e.g. `internal/tfplan/testdata/*.json`)
 - Test files colocated with source (`*_test.go`)
 
 ## Dependencies
@@ -55,14 +54,16 @@ golangci-lint run ./...
 | `muesli/reflow` v0.3.0 | Text wrapping and padding |
 | `blang/semver` v4.0.0 | Semantic versioning |
 | `rhysd/go-github-selfupdate` v1.2.3 | GitHub release-based self-update |
+| `hashicorp/terraform-json` | Canonical types for decoding `terraform show -json` plan output |
 
 ## Architecture Decisions
 
 1. **Elm Architecture (TEA):** TUI follows Bubble Tea's Model-Update-View pattern
-2. **Parser separation:** `internal/parser` is independent of TUI, produces structured data
-3. **Self-update:** Binary self-updates via GitHub releases with `-ldflags` version injection
-4. **Internal packages:** All under `internal/` for free refactoring
-5. **Piped input:** Reads from stdin, composable with shell pipelines
+2. **JSON-only, no regex parsing:** `internal/tfplan` decodes `terraform show -json` (via `hashicorp/terraform-json`) into a pre-diffed attribute tree; `internal/tui` renders that tree directly rather than re-parsing text
+3. **Runner separation:** `internal/runner` is the only place that shells out to `terraform`/`tofu` plan/show/apply, independent of TUI and decoding
+4. **Self-update:** Binary self-updates via GitHub releases with `-ldflags` version injection
+5. **Internal packages:** All under `internal/` for free refactoring
+6. **Piped input:** Reads `terraform show -json` output from stdin, composable with shell pipelines
 
 ## Security Considerations
 

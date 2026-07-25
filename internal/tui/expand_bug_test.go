@@ -5,22 +5,19 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 
-	"github.com/CaptShanks/terraprism/internal/parser"
+	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
 
-func threeResourcesWithFolds() []parser.Resource {
-	return []parser.Resource{
-		{Address: "a.one", Action: parser.ActionUpdate, RawLines: []string{
-			`  ~ resource "a" "one" {`, `      x = 1`, `    }`,
-		}},
-		{Address: "b.two", Action: parser.ActionUpdate, RawLines: []string{
-			`  ~ resource "b" "two" {`,
-			`      ~ metadata = {`, `          ~ values = {`, `              nested = true`, `            }`, `        }`,
-			`    }`,
-		}},
-		{Address: "c.three", Action: parser.ActionUpdate, RawLines: []string{
-			`  ~ resource "c" "three" {`, `      x = 3`, `    }`,
-		}},
+func threeResourcesWithFolds() []tfplan.Resource {
+	one := leaf("x", tfplan.ActionUpdate, tfplan.KindNumber, "1", "1")
+	two := mapBlock("metadata", tfplan.ActionUpdate,
+		mapBlock("values", tfplan.ActionUpdate, leaf("nested", tfplan.ActionUpdate, tfplan.KindBool, false, true)))
+	three := leaf("x", tfplan.ActionUpdate, tfplan.KindNumber, "3", "3")
+
+	return []tfplan.Resource{
+		{Address: "a.one", Action: tfplan.ActionUpdate, Attributes: withPaths([]tfplan.Attribute{one}, "")},
+		{Address: "b.two", Action: tfplan.ActionUpdate, Attributes: withPaths([]tfplan.Attribute{two}, "")},
+		{Address: "c.three", Action: tfplan.ActionUpdate, Attributes: withPaths([]tfplan.Attribute{three}, "")},
 	}
 }
 
@@ -29,7 +26,7 @@ func threeResourcesWithFolds() []parser.Resource {
 func TestExpandAllScopesToHighlightedItem(t *testing.T) {
 	resources := threeResourcesWithFolds()
 	m := Model{
-		plan:         &parser.Plan{Resources: resources},
+		plan:         &tfplan.Plan{Resources: resources},
 		expanded:     map[int]bool{},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  -1,
@@ -45,7 +42,7 @@ func TestExpandAllScopesToHighlightedItem(t *testing.T) {
 	if updated.expanded[0] || updated.expanded[2] {
 		t.Fatalf("siblings should NOT have been expanded by scoped `e`; expanded=%v", updated.expanded)
 	}
-	for _, block := range findFoldBlocks(resources[1], resources[1].RawLines[1:]) {
+	for _, block := range allFoldableAttributes(resources[1].Address, resources[1].Attributes, 0) {
 		if updated.foldedBlocks[block.Key] {
 			t.Fatalf("sub-fold %q of cursor's resource should be expanded after `e`", block.Key)
 		}
@@ -56,7 +53,7 @@ func TestExpandAllScopesToHighlightedItem(t *testing.T) {
 func TestCollapseAllScopesToHighlightedItem(t *testing.T) {
 	resources := threeResourcesWithFolds()
 	m := Model{
-		plan:         &parser.Plan{Resources: resources},
+		plan:         &tfplan.Plan{Resources: resources},
 		expanded:     map[int]bool{0: true, 1: true, 2: true},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  -1,
@@ -78,7 +75,7 @@ func TestCollapseAllScopesToHighlightedItem(t *testing.T) {
 func TestExpandEverythingIsGlobal(t *testing.T) {
 	resources := threeResourcesWithFolds()
 	m := Model{
-		plan:         &parser.Plan{Resources: resources},
+		plan:         &tfplan.Plan{Resources: resources},
 		expanded:     map[int]bool{},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  -1,
@@ -99,7 +96,7 @@ func TestExpandEverythingIsGlobal(t *testing.T) {
 func TestCollapseEverythingIsGlobal(t *testing.T) {
 	resources := threeResourcesWithFolds()
 	m := Model{
-		plan:         &parser.Plan{Resources: resources},
+		plan:         &tfplan.Plan{Resources: resources},
 		expanded:     map[int]bool{0: true, 1: true, 2: true},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  -1,
@@ -120,7 +117,7 @@ func TestCollapseEverythingIsGlobal(t *testing.T) {
 func TestExpandAllInsideSubBlockKeepsScope(t *testing.T) {
 	resources := threeResourcesWithFolds()
 	m := Model{
-		plan:         &parser.Plan{Resources: resources},
+		plan:         &tfplan.Plan{Resources: resources},
 		expanded:     map[int]bool{1: true},
 		foldedBlocks: make(map[string]bool),
 		blockCursor:  0,

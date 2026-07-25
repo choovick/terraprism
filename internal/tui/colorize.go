@@ -1,0 +1,98 @@
+package tui
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/CaptShanks/terraprism/internal/tfplan"
+)
+
+// actionPrefixSymbol returns the +/-/~ (or blank) diff-line symbol for an
+// attribute-level action.
+func actionPrefixSymbol(action tfplan.Action) string {
+	switch action {
+	case tfplan.ActionCreate:
+		return createSymbol
+	case tfplan.ActionDelete:
+		return destroySymbol
+	case tfplan.ActionUpdate:
+		return updateSymbol
+	default:
+		return " "
+	}
+}
+
+// renderScalarText renders a decoded JSON scalar as displayable text,
+// quoting strings so they read like HCL literals.
+func renderScalarText(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case json.Number:
+		return t.String()
+	case string:
+		return fmt.Sprintf("%q", t)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+// renderLeafValue renders a leaf attribute's value (no key, no line
+// prefix), applying sensitive/computed styling and old->new diffing.
+// Unchanged (no-op) values are always muted rather than colored by type —
+// they're just context, and coloring them by type (e.g. red for null,
+// yellow for numbers) made them visually compete with attributes that
+// actually changed. In practice renderAttributeTree filters no-op leaves
+// out into a "(N unchanged attributes hidden)" summary before they ever
+// reach here (matching Terraform's own CLI convention), so this case is
+// a defensive fallback, not the primary path.
+func renderLeafValue(attr tfplan.Attribute) string {
+	if attr.Sensitive {
+		return lipgloss.NewStyle().Foreground(replaceColor).Italic(true).Render("(sensitive value)")
+	}
+	computedText := attrComputedStyle.Render("(known after apply)")
+
+	switch attr.Action {
+	case tfplan.ActionCreate:
+		if attr.Computed {
+			return computedText
+		}
+		return attrNewValueStyle.Render(renderScalarText(attr.New))
+	case tfplan.ActionDelete:
+		return attrOldValueStyle.Render(renderScalarText(attr.Old))
+	case tfplan.ActionNoOp:
+		return mutedColor.Render(renderScalarText(attr.New))
+	default: // update
+		oldText := attrOldValueStyle.Render(renderScalarText(attr.Old))
+		newText := computedText
+		if !attr.Computed {
+			newText = attrNewValueStyle.Render(renderScalarText(attr.New))
+		}
+		return oldText + " → " + newText
+	}
+}
+
+// renderKeyValue renders "name = value" for a keyed leaf attribute, or
+// just "value" when keyed is false (a bare, positional list element).
+func renderKeyValue(attr tfplan.Attribute, keyed bool) string {
+	if !keyed {
+		return renderLeafValue(attr)
+	}
+	return attrNameStyle.Render(attr.Name) + " = " + renderLeafValue(attr)
+}
+
+// containerBrackets returns the open/close delimiters for a container
+// attribute's Kind.
+func containerBrackets(kind tfplan.ValueKind) (open, close string) {
+	if kind == tfplan.KindList {
+		return "[", "]"
+	}
+	return "{", "}"
+}

@@ -12,13 +12,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wordwrap"
 
-	"github.com/CaptShanks/terraprism/internal/parser"
+	"github.com/CaptShanks/terraprism/internal/tfplan"
 	"github.com/CaptShanks/terraprism/internal/updater"
 )
 
 // Model represents the TUI state
 type Model struct {
-	plan               *parser.Plan
+	plan               *tfplan.Plan
 	cursor             int
 	expanded           map[int]bool
 	foldedBlocks       map[string]bool
@@ -46,7 +46,7 @@ type Model struct {
 	confirmApply bool   // Waiting for confirmation
 
 	// Status filter fields
-	statusFilters map[parser.Action]bool // true = show resources with this action
+	statusFilters map[tfplan.Action]bool // true = show resources with this action
 	filtering     bool                   // filter picker is open
 	filterCursor  int                    // cursor in filter picker
 
@@ -79,28 +79,26 @@ const (
 var sortOptions = []SortOrder{SortDefault, SortByAction, SortByAddress, SortByType}
 
 // actionOrder defines sort order for actions (destructive last)
-var actionOrder = map[parser.Action]int{
-	parser.ActionCreate:       0,
-	parser.ActionRead:         1,
-	parser.ActionUpdate:       2,
-	parser.ActionReplace:      3,
-	parser.ActionDeleteCreate: 4,
-	parser.ActionCreateDelete: 5,
-	parser.ActionDestroy:      6,
-	parser.ActionOutput:       7,
-	parser.ActionNoOp:         8,
+var actionOrder = map[tfplan.Action]int{
+	tfplan.ActionCreate:  0,
+	tfplan.ActionRead:    1,
+	tfplan.ActionUpdate:  2,
+	tfplan.ActionReplace: 3,
+	tfplan.ActionForget:  4,
+	tfplan.ActionDelete:  5,
+	tfplan.ActionOutput:  6,
+	tfplan.ActionNoOp:    7,
 }
 
 // filterableActions is the ordered list of statuses available for filtering
-var filterableActions = []parser.Action{
-	parser.ActionCreate,
-	parser.ActionDestroy,
-	parser.ActionUpdate,
-	parser.ActionReplace,
-	parser.ActionRead,
-	parser.ActionDeleteCreate,
-	parser.ActionCreateDelete,
-	parser.ActionOutput,
+var filterableActions = []tfplan.Action{
+	tfplan.ActionCreate,
+	tfplan.ActionDelete,
+	tfplan.ActionUpdate,
+	tfplan.ActionReplace,
+	tfplan.ActionRead,
+	tfplan.ActionForget,
+	tfplan.ActionOutput,
 }
 
 // filteredResources returns indices into plan.Resources that pass the status filter.
@@ -180,14 +178,14 @@ func (m *Model) displayedResourceIndices() []int {
 }
 
 // NewModel creates a new TUI model (view-only mode)
-func NewModel(plan *parser.Plan, version string) Model {
+func NewModel(plan *tfplan.Plan, version string) Model {
 	ti := textinput.New()
 	ti.Placeholder = "Search..."
 	ti.CharLimit = 100
 	ti.Width = 40
 
 	return Model{
-		plan:           plan,
+		plan:           withDisplayResources(plan),
 		expanded:       make(map[int]bool),
 		foldedBlocks:   make(map[string]bool),
 		blockCursor:    -1,
@@ -202,14 +200,14 @@ func NewModel(plan *parser.Plan, version string) Model {
 }
 
 // NewModelWithApply creates a TUI model with apply capability
-func NewModelWithApply(plan *parser.Plan, planFile, tfCommand, version string) Model {
+func NewModelWithApply(plan *tfplan.Plan, planFile, tfCommand, version string) Model {
 	ti := textinput.New()
 	ti.Placeholder = "Search..."
 	ti.CharLimit = 100
 	ti.Width = 40
 
 	return Model{
-		plan:           plan,
+		plan:           withDisplayResources(plan),
 		expanded:       make(map[int]bool),
 		foldedBlocks:   make(map[string]bool),
 		blockCursor:    -1,
@@ -223,6 +221,21 @@ func NewModelWithApply(plan *parser.Plan, planFile, tfCommand, version string) M
 		sortOrder:      SortDefault,
 		currentVersion: version,
 	}
+}
+
+// withDisplayResources returns a Plan whose Resources includes output
+// changes as synthetic entries (see tfplan.Plan.DisplayResources), so the
+// rest of the model's rendering/navigation/filtering/sorting code — which
+// only ever reads plan.Resources — picks them up automatically without
+// needing its own separate output-change code path. The original plan is
+// left untouched (callers may still hold onto it, e.g. for history).
+func withDisplayResources(plan *tfplan.Plan) *tfplan.Plan {
+	if plan == nil || len(plan.OutputChanges) == 0 {
+		return plan
+	}
+	display := *plan
+	display.Resources = plan.DisplayResources()
+	return &display
 }
 
 // ShouldApply returns true if user chose to apply
@@ -538,7 +551,7 @@ func handleKeyFilter(m Model) (Model, tea.Cmd, bool) {
 	m.filtering = true
 	m.filterCursor = 0
 	if m.statusFilters == nil {
-		m.statusFilters = make(map[parser.Action]bool)
+		m.statusFilters = make(map[tfplan.Action]bool)
 	}
 	return m, nil, true
 }
@@ -767,7 +780,7 @@ func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "c":
 		// Clear all filters (show all)
-		m.statusFilters = make(map[parser.Action]bool)
+		m.statusFilters = make(map[tfplan.Action]bool)
 		return m, nil
 	}
 
@@ -829,16 +842,16 @@ func (m Model) currentResourceIndex() int {
 	return displayed[m.cursor]
 }
 
+// currentFoldBlocks returns the fold blocks currently visible (i.e. not
+// hidden inside a collapsed ancestor) for the cursor's resource, in
+// display order — used for blockCursor navigation.
 func (m Model) currentFoldBlocks() []foldBlock {
 	resourceIdx := m.currentResourceIndex()
 	if resourceIdx < 0 || resourceIdx >= len(m.plan.Resources) {
 		return nil
 	}
 	r := m.plan.Resources[resourceIdx]
-	if len(r.RawLines) <= 1 {
-		return nil
-	}
-	return m.visibleFoldBlocks(findFoldBlocks(r, r.RawLines[1:]))
+	return flattenFoldableAttributes(r.Address, r.Attributes, 0, m.resolveCollapsed)
 }
 
 func (m *Model) currentFoldBlock() (foldBlock, bool) {
@@ -867,13 +880,18 @@ func (m *Model) setCurrentFoldCollapsed(collapsed bool) bool {
 	return true
 }
 
+// setCurrentScopeFoldsCollapsed sets the collapsed state of the cursor's
+// current fold block and all its descendants (structurally, regardless of
+// their current visibility), or of the whole resource's fold tree when no
+// sub-fold is selected.
 func (m *Model) setCurrentScopeFoldsCollapsed(collapsed bool) bool {
 	resourceIdx := m.currentResourceIndex()
 	if resourceIdx < 0 || resourceIdx >= len(m.plan.Resources) || !m.expanded[resourceIdx] {
 		return false
 	}
 
-	blocks := findFoldBlocks(m.plan.Resources[resourceIdx], m.plan.Resources[resourceIdx].RawLines[1:])
+	r := m.plan.Resources[resourceIdx]
+	blocks := allFoldableAttributes(r.Address, r.Attributes, 0)
 	if len(blocks) == 0 {
 		return false
 	}
@@ -881,7 +899,7 @@ func (m *Model) setCurrentScopeFoldsCollapsed(collapsed bool) bool {
 	if current, ok := m.currentFoldBlock(); ok {
 		changed := false
 		for _, block := range blocks {
-			if block.Start >= current.Start && block.End <= current.End {
+			if block.Path == current.Path || isDescendantPath(block.Path, current.Path) {
 				m.foldedBlocks[block.Key] = collapsed
 				changed = true
 			}
@@ -901,10 +919,7 @@ func (m *Model) setDisplayedFoldsCollapsed(collapsed bool) {
 			continue
 		}
 		r := m.plan.Resources[resourceIdx]
-		if len(r.RawLines) <= 1 {
-			continue
-		}
-		for _, block := range findFoldBlocks(r, r.RawLines[1:]) {
+		for _, block := range allFoldableAttributes(r.Address, r.Attributes, 0) {
 			m.foldedBlocks[block.Key] = collapsed
 		}
 	}
@@ -1171,8 +1186,9 @@ func (m *Model) renderResources() string {
 		b.WriteString("\n")
 		lineCount++
 
-		if isExpanded && len(r.RawLines) > 1 {
-			m.renderExpandedContent(&b, r, isSelected && m.blockCursor >= 0, &lineCount)
+		if isExpanded && len(r.Attributes) > 0 {
+			foldIdx := 0
+			m.renderAttributeTree(&b, r.Address, r.Attributes, 0, true, isSelected && m.blockCursor >= 0, &foldIdx, &lineCount)
 			b.WriteString("\n")
 			lineCount++
 		}
@@ -1196,180 +1212,118 @@ func (m *Model) renderResources() string {
 
 const defaultCollapsedFoldLines = 30
 
+// foldBlock is one collapsible container attribute (a map or list with
+// children) within a resource's attribute tree.
 type foldBlock struct {
-	Start          int
-	End            int
-	Key            string
-	LineCount      int
-	Heredoc        bool
-	HeredocPair    bool
-	OldEnd         int
-	AddStart       int
-	OldLineCount   int
-	NewLineCount   int
-	HeredocEndMark string
+	Key   string // address + "#" + Path; stable across re-renders
+	Path  string
+	Attr  tfplan.Attribute
+	Depth int
 }
 
-func findFoldBlocks(r parser.Resource, lines []string) []foldBlock {
+func foldKey(address, path string) string {
+	return address + "#" + path
+}
+
+// isDescendantPath reports whether path is nested under ancestorPath
+// (a dotted attribute path or bracketed list-index path).
+func isDescendantPath(path, ancestorPath string) bool {
+	return strings.HasPrefix(path, ancestorPath+".") || strings.HasPrefix(path, ancestorPath+"[")
+}
+
+// isContainerAttr reports whether an attribute is a non-empty, non-sensitive
+// map or list — i.e. something that renders as a foldable block.
+func isContainerAttr(a tfplan.Attribute) bool {
+	return (a.Kind == tfplan.KindMap || a.Kind == tfplan.KindList) && len(a.Children) > 0 && !a.Sensitive
+}
+
+// countRenderedLines estimates how many lines a container attribute would
+// take fully expanded (open + close + recursively every descendant),
+// used to decide the default collapsed/expanded state.
+func countRenderedLines(a tfplan.Attribute) int {
+	if !isContainerAttr(a) {
+		return 1
+	}
+	n := 2
+	for _, c := range a.Children {
+		n += countRenderedLines(c)
+	}
+	return n
+}
+
+// allFoldableAttributes returns every container attribute in the tree,
+// structurally, regardless of current fold state. Used by "expand/collapse
+// scope" operations, which must reach descendants even when an
+// intermediate ancestor happens to be currently collapsed.
+func allFoldableAttributes(address string, attrs []tfplan.Attribute, depth int) []foldBlock {
 	var blocks []foldBlock
-	for idx := 0; idx < len(lines); idx++ {
-		if idx == 0 && isResourceDeclarationLine(lines[idx]) {
+	for _, a := range attrs {
+		if !isContainerAttr(a) {
 			continue
 		}
+		blocks = append(blocks, foldBlock{Key: foldKey(address, a.Path), Path: a.Path, Attr: a, Depth: depth})
+		blocks = append(blocks, allFoldableAttributes(address, a.Children, depth+1)...)
+	}
+	return blocks
+}
 
-		if block, ok := findHeredocPairFold(r, lines, idx); ok {
-			blocks = append(blocks, block)
-			idx = block.End - 1
+// flattenFoldableAttributes returns the fold blocks currently visible:
+// like allFoldableAttributes, but stops descending into a container once
+// it's collapsed, matching what renderAttributeTree actually draws.
+func flattenFoldableAttributes(address string, attrs []tfplan.Attribute, depth int, isCollapsed func(key string, size int) bool) []foldBlock {
+	var blocks []foldBlock
+	for _, a := range attrs {
+		if !isContainerAttr(a) {
 			continue
 		}
-
-		if marker := parseHeredocMarkerFromLine(lines[idx]); marker != "" {
-			end := findHeredocBlockEnd(lines, idx+1, marker)
-			if end > idx+1 {
-				blocks = append(blocks, newFoldBlock(r, lines, idx, end, true))
-				idx = end - 1
-			}
-			continue
-		}
-
-		if !isFoldableStructureStart(lines[idx]) {
-			continue
-		}
-		end := findBalancedStructureBlockEnd(lines, idx)
-		if end > idx+1 {
-			blocks = append(blocks, newFoldBlock(r, lines, idx, end, false))
+		key := foldKey(address, a.Path)
+		blocks = append(blocks, foldBlock{Key: key, Path: a.Path, Attr: a, Depth: depth})
+		if !isCollapsed(key, countRenderedLines(a)) {
+			blocks = append(blocks, flattenFoldableAttributes(address, a.Children, depth+1, isCollapsed)...)
 		}
 	}
 	return blocks
 }
 
-func findHeredocPairFold(r parser.Resource, lines []string, idx int) (foldBlock, bool) {
-	if idx >= len(lines) {
-		return foldBlock{}, false
+// resolveCollapsed looks up an explicit fold-state override, falling back
+// to the default-collapse-by-size heuristic.
+func (m *Model) resolveCollapsed(key string, size int) bool {
+	if collapsed, ok := m.foldedBlocks[key]; ok {
+		return collapsed
 	}
-
-	trimmed := strings.TrimLeft(lines[idx], " \t")
-	if !strings.HasPrefix(trimmed, "- ") || !isHeredocMarker(trimmed[2:]) {
-		return foldBlock{}, false
-	}
-
-	endMarker := parseHeredocEnd(trimmed[2:])
-	if endMarker == "" {
-		return foldBlock{}, false
-	}
-
-	oldEnd := findHeredocBlockEnd(lines, idx+1, endMarker)
-	if oldEnd < 0 {
-		return foldBlock{}, false
-	}
-
-	addStart := findAddHeredocStart(lines, oldEnd)
-	if addStart < 0 {
-		return foldBlock{}, false
-	}
-
-	newEnd := findHeredocBlockEnd(lines, addStart+1, endMarker)
-	if newEnd < 0 {
-		return foldBlock{}, false
-	}
-
-	block := newFoldBlock(r, lines, idx, newEnd, false)
-	block.HeredocPair = true
-	block.OldEnd = oldEnd
-	block.AddStart = addStart
-	block.OldLineCount = oldEnd - idx - 2
-	block.NewLineCount = newEnd - addStart - 2
-	block.HeredocEndMark = endMarker
-	if block.OldLineCount < 0 {
-		block.OldLineCount = 0
-	}
-	if block.NewLineCount < 0 {
-		block.NewLineCount = 0
-	}
-	block.Key = fmt.Sprintf("%s:%d:heredoc-diff:%s", r.Address, idx, endMarker)
-	return block, true
-}
-
-func (m *Model) visibleFoldBlocks(blocks []foldBlock) []foldBlock {
-	visible := make([]foldBlock, 0, len(blocks))
-	var ancestors []foldBlock
-
-	for _, block := range blocks {
-		for len(ancestors) > 0 && block.Start >= ancestors[len(ancestors)-1].End {
-			ancestors = ancestors[:len(ancestors)-1]
-		}
-
-		hidden := false
-		for _, ancestor := range ancestors {
-			if m.isFoldCollapsed(ancestor) {
-				hidden = true
-				break
-			}
-		}
-		if !hidden {
-			visible = append(visible, block)
-		}
-
-		ancestors = append(ancestors, block)
-	}
-
-	return visible
-}
-
-func newFoldBlock(r parser.Resource, lines []string, start, end int, heredoc bool) foldBlock {
-	key := fmt.Sprintf("%s:%d:%s", r.Address, start, strings.TrimSpace(lines[start]))
-	lineCount := end - start - 1
-	if lineCount < 0 {
-		lineCount = 0
-	}
-	return foldBlock{Start: start, End: end, Key: key, LineCount: lineCount, Heredoc: heredoc}
-}
-
-func isResourceDeclarationLine(line string) bool {
-	content := strings.TrimSpace(stripDiffPrefix(strings.TrimLeft(line, " \t")))
-	return strings.HasPrefix(content, "resource ") || strings.HasPrefix(content, "data ")
-}
-
-func isFoldableStructureStart(line string) bool {
-	content := strings.TrimSpace(stripDiffPrefix(strings.TrimLeft(line, " \t")))
-	if content == "{" || content == "[" || content == "}" || content == "]" {
-		return false
-	}
-	return strings.HasSuffix(content, "{") || strings.HasSuffix(content, "[")
-}
-
-func stripDiffPrefix(s string) string {
-	if hasDiffPrefix(s) {
-		return s[2:]
-	}
-	return s
+	return size >= defaultCollapsedFoldLines
 }
 
 func (m *Model) isFoldCollapsed(block foldBlock) bool {
-	if collapsed, ok := m.foldedBlocks[block.Key]; ok {
-		return collapsed
-	}
-	return block.LineCount >= defaultCollapsedFoldLines
+	return m.resolveCollapsed(block.Key, countRenderedLines(block.Attr))
 }
 
-func (m Model) renderFoldHeader(line string, action parser.Action, block foldBlock, collapsed, selected bool, maxWidth int) string {
+// renderContainerHeader renders a fold block's header row: the
+// expand/collapse indicator, diff-action symbol, and "name = {"/"[" (or
+// just the bracket when keyed is false, i.e. a positional list element).
+func (m Model) renderContainerHeader(indent string, attr tfplan.Attribute, keyed, collapsed, selected bool, maxWidth int) string {
 	indicator := expandedIndicator
 	if collapsed {
 		indicator = collapsedIndicator
 	}
+	open, closeBracket := containerBrackets(attr.Kind)
 
-	rendered := m.wrapAndColorize(line, action, maxWidth)
-	indent := extractIndent(line)
-	content := strings.TrimPrefix(rendered, indent)
-	if block.HeredocPair {
-		content = updateSymbol + " " + mutedColor.Render(fmt.Sprintf("heredoc diff <<-%s", block.HeredocEndMark))
+	var content string
+	if keyed {
+		content = attrNameStyle.Render(attr.Name) + " = " + mutedColor.Render(open)
+	} else {
+		content = mutedColor.Render(open)
 	}
-	result := indent + indicator + " " + content
-	if block.HeredocPair {
-		result += mutedColor.Render(fmt.Sprintf(" (%d → %d lines)", block.OldLineCount, block.NewLineCount))
-	} else if collapsed {
-		result += mutedColor.Render(fmt.Sprintf(" ... (%d lines)", block.LineCount))
+
+	result := indent + indicator + " " + actionPrefixSymbol(attr.Action) + " " + content
+	if collapsed {
+		noun := "attrs"
+		if attr.Kind == tfplan.KindList {
+			noun = "items"
+		}
+		result += mutedColor.Render(fmt.Sprintf(" ... %d %s %s", len(attr.Children), noun, closeBracket))
 	}
+
 	if !selected {
 		return result
 	}
@@ -1378,631 +1332,33 @@ func (m Model) renderFoldHeader(line string, action parser.Action, block foldBlo
 	if targetWidth <= 0 {
 		targetWidth = maxWidth
 	}
-	if targetWidth > 0 && utf8.RuneCountInString(stripANSI(result)) < targetWidth {
-		result += strings.Repeat(" ", targetWidth-utf8.RuneCountInString(stripANSI(result)))
+	plainLen := utf8.RuneCountInString(stripANSI(result))
+	if targetWidth > 0 && plainLen < targetWidth {
+		result += strings.Repeat(" ", targetWidth-plainLen)
 	}
 	return lipgloss.NewStyle().Background(selectedBg).Foreground(textColor).Render(result)
 }
 
-func renderExpandedHeredocLines(lines []string) string {
-	if len(lines) == 0 {
-		return ""
-	}
-
-	contentLines := lines[:len(lines)-1]
-	baseIndent := heredocContentBaseIndent(contentLines)
-	var b strings.Builder
-	for _, contentLine := range contentLines {
-		b.WriteString(colorizeHeredocContentLine(contentLine, baseIndent))
-		b.WriteString("\n")
-	}
-	b.WriteString(lines[len(lines)-1])
-	b.WriteString("\n")
-	return b.String()
+func closingBraceLine(indent string, kind tfplan.ValueKind) string {
+	_, closeBracket := containerBrackets(kind)
+	return indent + mutedColor.Render(closeBracket)
 }
 
-func renderHeredocPairFoldDiff(lines []string, block foldBlock, maxWidth int, contextSize int) string {
-	oldContent := extractHeredocContent(lines[block.Start+1 : block.OldEnd-1])
-	newContent := extractHeredocContent(lines[block.AddStart+1 : block.End-1])
-
-	diff := ComputeDiff(oldContent, newContent)
-	contextDiff := ContextDiff(diff, contextSize)
-	if contextDiff == nil {
-		return ""
+// unchangedHiddenNote formats the "# (N unchanged attributes hidden)"
+// summary line for a run of no-op attributes, matching Terraform CLI's
+// own wording (singular "attribute" for exactly one).
+func unchangedHiddenNote(count int) string {
+	noun := "attribute"
+	if count != 1 {
+		noun = "attributes"
 	}
-
-	baseIndent := extractIndent(lines[block.Start])
-	var b strings.Builder
-	b.WriteString(baseIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ heredoc diff ┄┄┄"))
-	b.WriteString("\n")
-	renderDiffLines(&b, contextDiff, baseIndent, maxWidth)
-	b.WriteString(baseIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ end heredoc diff ┄┄┄"))
-	b.WriteString("\n")
-	return b.String()
-}
-
-// renderExpandedContent renders the expanded lines for a resource, applying
-// word wrapping, userdata decoding, YAML/heredoc diff detection, and generic
-// collapsible folds for multiline attributes and nested blocks.
-func (m *Model) renderExpandedContent(b *strings.Builder, r parser.Resource, selected bool, lineCount *int) {
-	maxWidth := m.viewport.Width
-	lines := r.RawLines[1:]
-	folds := findFoldBlocks(r, lines)
-	foldsByStart := make(map[int]foldBlock, len(folds))
-	for _, block := range folds {
-		foldsByStart[block.Start] = block
-	}
-
-	foldIdx := 0
-	for idx := 0; idx < len(lines); idx++ {
-		line := lines[idx]
-
-		if decoded, ok := m.tryRenderUserdata(line, r.Action, maxWidth); ok {
-			b.WriteString(decoded)
-			b.WriteString("\n")
-			*lineCount += strings.Count(decoded, "\n") + 1
-			continue
-		}
-
-		if block, ok := foldsByStart[idx]; ok {
-			blockSelected := selected && foldIdx == m.blockCursor
-			if blockSelected {
-				m.selectedLineStart = *lineCount
-			}
-			collapsed := m.isFoldCollapsed(block)
-			b.WriteString(m.renderFoldHeader(line, r.Action, block, collapsed, blockSelected, maxWidth))
-			b.WriteString("\n")
-			*lineCount++
-			foldIdx++
-
-			if collapsed {
-				idx = block.End - 1
-				continue
-			}
-			if block.HeredocPair {
-				rendered := renderHeredocPairFoldDiff(lines, block, maxWidth, m.diffContextSize())
-				b.WriteString(rendered)
-				*lineCount += strings.Count(rendered, "\n")
-				idx = block.End - 1
-				continue
-			}
-			if block.Heredoc {
-				rendered := renderExpandedHeredocLines(lines[idx+1 : block.End])
-				b.WriteString(rendered)
-				*lineCount += strings.Count(rendered, "\n")
-				idx = block.End - 1
-				continue
-			}
-			continue
-		}
-
-		if consumed, rendered := m.tryRenderHeredocDiff(lines, idx, r.Action, maxWidth); consumed > 0 {
-			b.WriteString(rendered)
-			b.WriteString("\n")
-			*lineCount += strings.Count(rendered, "\n") + 1
-			idx += consumed - 1
-			continue
-		}
-
-		if consumed, rendered := m.tryRenderHeredocBlock(lines, idx, r.Action, maxWidth); consumed > 0 {
-			b.WriteString(rendered)
-			*lineCount += strings.Count(rendered, "\n")
-			idx += consumed - 1
-			continue
-		}
-
-		coloredLine := m.wrapAndColorize(line, r.Action, maxWidth)
-		b.WriteString(coloredLine)
-		b.WriteString("\n")
-		*lineCount++
-	}
-
-}
-
-func findBalancedStructureBlockEnd(lines []string, start int) int {
-	open, close, ok := foldDelimiters(lines[start])
-	if !ok {
-		return -1
-	}
-
-	depth := 0
-	for i := start; i < len(lines); i++ {
-		depth += strings.Count(lines[i], open) - strings.Count(lines[i], close)
-		if i > start && depth <= 0 {
-			return i + 1
-		}
-	}
-	return -1
-}
-
-func foldDelimiters(line string) (open, close string, ok bool) {
-	content := strings.TrimSpace(stripDiffPrefix(strings.TrimLeft(line, " \t")))
-	switch {
-	case strings.HasSuffix(content, "{"):
-		return "{", "}", true
-	case strings.HasSuffix(content, "["):
-		return "[", "]", true
-	default:
-		return "", "", false
-	}
-}
-
-func (m Model) tryRenderHeredocBlock(lines []string, idx int, action parser.Action, maxWidth int) (int, string) {
-	if idx >= len(lines) {
-		return 0, ""
-	}
-
-	endMarker := parseHeredocMarkerFromLine(lines[idx])
-	if endMarker == "" {
-		return 0, ""
-	}
-
-	end := findHeredocBlockEnd(lines, idx+1, endMarker)
-	if end < 0 {
-		return 0, ""
-	}
-
-	contentLines := lines[idx+1 : end-1]
-	baseIndent := heredocContentBaseIndent(contentLines)
-
-	var b strings.Builder
-	b.WriteString(m.wrapAndColorize(lines[idx], action, maxWidth))
-	b.WriteString("\n")
-	for _, contentLine := range contentLines {
-		b.WriteString(colorizeHeredocContentLine(contentLine, baseIndent))
-		b.WriteString("\n")
-	}
-	b.WriteString(lines[end-1])
-	b.WriteString("\n")
-	return end - idx, b.String()
-}
-
-func parseHeredocMarkerFromLine(line string) string {
-	trimmed := strings.TrimLeft(line, " \t")
-	if hasDiffPrefix(trimmed) {
-		trimmed = trimmed[2:]
-	}
-
-	idx := strings.Index(trimmed, "<<")
-	if idx < 0 {
-		return ""
-	}
-
-	marker := strings.TrimSpace(trimmed[idx:])
-	switch {
-	case strings.HasPrefix(marker, "<<-"):
-		marker = strings.TrimSpace(marker[3:])
-	case strings.HasPrefix(marker, "<<"):
-		marker = strings.TrimSpace(marker[2:])
-	default:
-		return ""
-	}
-
-	fields := strings.Fields(marker)
-	if len(fields) == 0 {
-		return ""
-	}
-	return strings.TrimSuffix(fields[0], ",")
-}
-
-func hasDiffPrefix(s string) bool {
-	return len(s) >= 2 && s[1] == ' ' && (s[0] == '+' || s[0] == '-' || s[0] == '~')
-}
-
-func heredocContentBaseIndent(lines []string) int {
-	minAll := -1
-	minNonDiffLike := -1
-
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		trimmed := strings.TrimLeft(line, " \t")
-		indentLen := len(line) - len(trimmed)
-		if minAll < 0 || indentLen < minAll {
-			minAll = indentLen
-		}
-		if !hasDiffPrefix(trimmed) {
-			if minNonDiffLike < 0 || indentLen < minNonDiffLike {
-				minNonDiffLike = indentLen
-			}
-		}
-	}
-
-	if minNonDiffLike >= 0 {
-		return minNonDiffLike
-	}
-	return minAll
-}
-
-func colorizeHeredocContentLine(line string, baseIndent int) string {
-	trimmed := strings.TrimLeft(line, " \t")
-	if !hasDiffPrefix(trimmed) || baseIndent < 2 {
-		return line
-	}
-
-	indent := line[:len(line)-len(trimmed)]
-	if len(indent) != baseIndent-2 {
-		return line
-	}
-
-	prefix := trimmed[:1]
-	content := trimmed[2:]
-	switch prefix {
-	case "+":
-		prefix = lipgloss.NewStyle().Foreground(createColor).Render(prefix)
-	case "-":
-		prefix = lipgloss.NewStyle().Foreground(destroyColor).Render(prefix)
-	case "~":
-		prefix = lipgloss.NewStyle().Foreground(updateColor).Render(prefix)
-	}
-
-	return indent + prefix + " " + content
-}
-
-// wrapAndColorize wraps a raw HCL line to the viewport width and colorizes
-// each sub-line, preserving indentation and prefix alignment.
-func (m Model) wrapAndColorize(line string, action parser.Action, maxWidth int) string {
-	if maxWidth <= 0 {
-		return m.colorizeHCLLine(line, action)
-	}
-
-	trimmed := strings.TrimLeft(line, " \t")
-	indent := line[:len(line)-len(trimmed)]
-	indentWidth := utf8.RuneCountInString(indent)
-
-	var rawPrefix, content string
-	lineAction := action
-	switch {
-	case strings.HasPrefix(trimmed, "+ "):
-		rawPrefix = "+ "
-		content = trimmed[2:]
-		lineAction = parser.ActionCreate
-	case strings.HasPrefix(trimmed, "- "):
-		rawPrefix = "- "
-		content = trimmed[2:]
-		lineAction = parser.ActionDestroy
-	case strings.HasPrefix(trimmed, "~ "):
-		rawPrefix = "~ "
-		content = trimmed[2:]
-		lineAction = parser.ActionUpdate
-	default:
-		rawPrefix = "  "
-		content = trimmed
-	}
-
-	prefixWidth := utf8.RuneCountInString(rawPrefix)
-	availableWidth := maxWidth - indentWidth - prefixWidth
-	if availableWidth < 20 || utf8.RuneCountInString(content) <= availableWidth {
-		return m.colorizeHCLLine(line, action)
-	}
-
-	wrapped := wordwrap.String(content, availableWidth)
-	subLines := strings.Split(wrapped, "\n")
-	if len(subLines) <= 1 {
-		return m.colorizeHCLLine(line, action)
-	}
-
-	continuationIndent := indent + strings.Repeat(" ", prefixWidth)
-
-	var b strings.Builder
-	for i, sub := range subLines {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		if i == 0 {
-			reconstructed := indent + rawPrefix + sub
-			b.WriteString(m.colorizeHCLLine(reconstructed, action))
-		} else {
-			b.WriteString(continuationIndent)
-			b.WriteString(m.colorizeHCLContent(strings.TrimSpace(sub), lineAction))
-		}
-	}
-
-	return b.String()
-}
-
-// parseUserdataLinePrefix parses prefix and content from a trimmed line.
-func parseUserdataLinePrefix(trimmed string, action parser.Action) (rawPrefix, content string, lineAction parser.Action) {
-	switch {
-	case strings.HasPrefix(trimmed, "+ "):
-		return "+ ", trimmed[2:], parser.ActionCreate
-	case strings.HasPrefix(trimmed, "- "):
-		return "- ", trimmed[2:], parser.ActionDestroy
-	case strings.HasPrefix(trimmed, "~ "):
-		return "~ ", trimmed[2:], parser.ActionUpdate
-	default:
-		return "  ", trimmed, action
-	}
-}
-
-func (m Model) renderUserdataDiff(oldB64, newB64, key, decodedIndent string, headerLine string, maxWidth int) string {
-	oldDecoded, oldOk := TryDecodeUserdata(oldB64)
-	newDecoded, newOk := TryDecodeUserdata(newB64)
-	if !oldOk && !newOk {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString(headerLine)
-	b.WriteString("\n")
-	b.WriteString(decodedIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ decoded " + key + " ┄┄┄"))
-	b.WriteString("\n")
-	if oldOk && newOk {
-		oldLines := strings.Split(oldDecoded, "\n")
-		newLines := strings.Split(newDecoded, "\n")
-		diff := ComputeDiff(oldLines, newLines)
-		contextDiff := ContextDiff(diff, m.diffContextSize())
-		if contextDiff == nil {
-			b.WriteString(decodedIndent)
-			b.WriteString(mutedColor.Render("  (no changes in decoded content)"))
-			b.WriteString("\n")
-		} else {
-			renderDiffLines(&b, contextDiff, decodedIndent, maxWidth)
-		}
-	} else {
-		if oldOk {
-			for _, ol := range strings.Split(oldDecoded, "\n") {
-				b.WriteString(decodedIndent)
-				b.WriteString(lipgloss.NewStyle().Foreground(destroyColor).Render("- " + ol))
-				b.WriteString("\n")
-			}
-		}
-		if newOk {
-			for _, nl := range strings.Split(newDecoded, "\n") {
-				b.WriteString(decodedIndent)
-				b.WriteString(lipgloss.NewStyle().Foreground(createColor).Render("+ " + nl))
-				b.WriteString("\n")
-			}
-		}
-	}
-	b.WriteString(decodedIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ end " + key + " ┄┄┄"))
-	return b.String()
-}
-
-func userdataLineStyle(lineAction parser.Action) lipgloss.Style {
-	switch lineAction {
-	case parser.ActionCreate:
-		return lipgloss.NewStyle().Foreground(createColor)
-	case parser.ActionDestroy:
-		return lipgloss.NewStyle().Foreground(destroyColor)
-	default:
-		return lipgloss.NewStyle().Foreground(textColor)
-	}
-}
-
-// tryRenderUserdata detects user_data attributes with base64 content and
-// renders them decoded with diff highlighting for changes.
-func (m Model) tryRenderUserdata(line string, action parser.Action, maxWidth int) (string, bool) {
-	trimmed := strings.TrimLeft(line, " \t")
-	indent := line[:len(line)-len(trimmed)]
-	rawPrefix, content, lineAction := parseUserdataLinePrefix(trimmed, action)
-
-	eqIdx := strings.Index(content, " = ")
-	if eqIdx < 0 {
-		return "", false
-	}
-	key := strings.TrimSpace(content[:eqIdx])
-	if key != "user_data" && key != "user_data_base64" {
-		return "", false
-	}
-	value := strings.TrimSpace(content[eqIdx+3:])
-	decodedIndent := indent + strings.Repeat(" ", len(rawPrefix))
-	headerLine := m.colorizeHCLLine(line, action)
-
-	if strings.Contains(value, " -> ") {
-		parts := strings.SplitN(value, " -> ", 2)
-		oldB64 := unquote(strings.TrimSpace(parts[0]))
-		newB64 := unquote(strings.TrimSpace(parts[1]))
-		rendered := m.renderUserdataDiff(oldB64, newB64, key, decodedIndent, headerLine, maxWidth)
-		if rendered == "" {
-			return "", false
-		}
-		return rendered, true
-	}
-
-	raw := unquote(value)
-	decoded, ok := TryDecodeUserdata(raw)
-	if !ok {
-		return "", false
-	}
-
-	var b strings.Builder
-	b.WriteString(headerLine)
-	b.WriteString("\n")
-	b.WriteString(decodedIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ decoded " + key + " ┄┄┄"))
-	b.WriteString("\n")
-	style := userdataLineStyle(lineAction)
-	for _, dl := range strings.Split(decoded, "\n") {
-		wrapped := wrapText(dl, maxWidth-len(decodedIndent)-2)
-		for _, wl := range strings.Split(wrapped, "\n") {
-			b.WriteString(decodedIndent)
-			b.WriteString(style.Render("  " + wl))
-			b.WriteString("\n")
-		}
-	}
-	b.WriteString(decodedIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ end " + key + " ┄┄┄"))
-	return b.String(), true
-}
-
-// tryRenderHeredocDiff detects paired remove/add heredoc blocks starting at
-// index idx and renders them as a granular diff. Handles two patterns:
-//   - Heredoc blocks: "- <<-EOT" ... "EOT," followed by "+ <<-EOT" ... "EOT,"
-//   - Prefixed blocks: consecutive "- " lines followed by consecutive "+ " lines
-func (m Model) tryRenderHeredocDiff(lines []string, idx int, action parser.Action, maxWidth int) (int, string) {
-	if idx >= len(lines) {
-		return 0, ""
-	}
-
-	trimmed := strings.TrimLeft(lines[idx], " \t")
-
-	if strings.HasPrefix(trimmed, "- ") && isHeredocMarker(trimmed[2:]) {
-		return m.renderHeredocPairDiff(lines, idx, maxWidth)
-	}
-
-	if strings.HasPrefix(trimmed, "- ") {
-		return m.renderPrefixedBlockDiff(lines, idx, action, maxWidth)
-	}
-
-	return 0, ""
-}
-
-func isHeredocMarker(s string) bool {
-	return strings.HasPrefix(strings.TrimSpace(s), "<<")
-}
-
-func parseHeredocEnd(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "<<-")
-	s = strings.TrimPrefix(s, "<<")
-	return strings.TrimSpace(s)
-}
-
-// findHeredocBlockEnd returns the index past the end marker line, or -1 if not found.
-func findHeredocBlockEnd(lines []string, startIdx int, endMarker string) int {
-	for i := startIdx; i < len(lines); i++ {
-		lt := strings.TrimSpace(lines[i])
-		if isHeredocEndLine(lt, endMarker) {
-			return i + 1
-		}
-	}
-	return -1
-}
-
-func isHeredocEndLine(trimmedLine, endMarker string) bool {
-	if trimmedLine == endMarker || trimmedLine == endMarker+"," {
-		return true
-	}
-	rest, ok := strings.CutPrefix(trimmedLine, endMarker)
-	if !ok {
-		return false
-	}
-	return strings.HasPrefix(rest, " -> ") || strings.HasPrefix(rest, ", -> ")
-}
-
-// findAddHeredocStart finds the "+ <<-EOT" line, skipping blank lines. Returns -1 if not found.
-func findAddHeredocStart(lines []string, fromIdx int) int {
-	for i := fromIdx; i < len(lines); i++ {
-		at := strings.TrimLeft(lines[i], " \t")
-		if strings.HasPrefix(at, "+ ") && isHeredocMarker(at[2:]) {
-			return i
-		}
-		if strings.TrimSpace(lines[i]) != "" {
-			return -1
-		}
-	}
-	return -1
-}
-
-// renderHeredocPairDiff handles paired heredoc blocks where content lines
-// inside the heredoc do NOT have individual +/- prefixes.
-func (m Model) renderHeredocPairDiff(lines []string, idx int, maxWidth int) (int, string) {
-	firstTrimmed := strings.TrimLeft(lines[idx], " \t")
-	endMarker := parseHeredocEnd(firstTrimmed[2:])
-	if endMarker == "" {
-		return 0, ""
-	}
-
-	oldEnd := findHeredocBlockEnd(lines, idx+1, endMarker)
-	if oldEnd < 0 {
-		return 0, ""
-	}
-
-	addHeredocIdx := findAddHeredocStart(lines, oldEnd)
-	if addHeredocIdx < 0 {
-		return 0, ""
-	}
-
-	newEnd := findHeredocBlockEnd(lines, addHeredocIdx+1, endMarker)
-	if newEnd < 0 {
-		return 0, ""
-	}
-
-	oldContent := extractHeredocContent(lines[idx+1 : oldEnd-1])
-	newContent := extractHeredocContent(lines[addHeredocIdx+1 : newEnd-1])
-	if len(oldContent) == 0 && len(newContent) == 0 {
-		return 0, ""
-	}
-
-	diff := ComputeDiff(oldContent, newContent)
-	contextDiff := ContextDiff(diff, m.diffContextSize())
-	if contextDiff == nil {
-		return 0, ""
-	}
-
-	baseIndent := extractIndent(lines[idx])
-	var b strings.Builder
-	b.WriteString(baseIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ heredoc diff ┄┄┄"))
-	b.WriteString("\n")
-	renderDiffLines(&b, contextDiff, baseIndent, maxWidth)
-	b.WriteString(baseIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ end heredoc diff ┄┄┄"))
-	b.WriteString("\n")
-	return newEnd - idx, b.String()
-}
-
-// renderPrefixedBlockDiff handles blocks where each line has a +/- prefix.
-func (m Model) renderPrefixedBlockDiff(lines []string, idx int, action parser.Action, maxWidth int) (int, string) {
-	removeEnd := idx
-	for removeEnd < len(lines) {
-		t := strings.TrimLeft(lines[removeEnd], " \t")
-		if !strings.HasPrefix(t, "- ") {
-			break
-		}
-		removeEnd++
-	}
-
-	if removeEnd == idx {
-		return 0, ""
-	}
-
-	addStart := removeEnd
-	addEnd := removeEnd
-	for addEnd < len(lines) {
-		t := strings.TrimLeft(lines[addEnd], " \t")
-		if !strings.HasPrefix(t, "+ ") {
-			break
-		}
-		addEnd++
-	}
-
-	if addEnd == addStart {
-		return 0, ""
-	}
-
-	if (removeEnd-idx) < 3 && (addEnd-addStart) < 3 {
-		return 0, ""
-	}
-
-	oldContent := extractPrefixedContent(lines[idx:removeEnd], "- ")
-	newContent := extractPrefixedContent(lines[addStart:addEnd], "+ ")
-
-	if len(oldContent) == 0 || len(newContent) == 0 {
-		return 0, ""
-	}
-
-	diff := ComputeDiff(oldContent, newContent)
-	contextDiff := ContextDiff(diff, m.diffContextSize())
-	if contextDiff == nil {
-		return 0, ""
-	}
-
-	baseIndent := extractIndent(lines[idx])
-
-	var b strings.Builder
-	renderDiffLines(&b, contextDiff, baseIndent, maxWidth)
-
-	return addEnd - idx, b.String()
+	return fmt.Sprintf("# (%d unchanged %s hidden)", count, noun)
 }
 
 // renderDiffLines writes context-diff lines into a builder, handling all
-// DiffOp types including DiffSeparator for collapsed equal runs.
+// DiffOp types including DiffSeparator for collapsed equal runs. Format
+// agnostic over []string, so it's reused unchanged from the old
+// heredoc/text-diff renderer for both multiline-string and userdata diffs.
 func renderDiffLines(b *strings.Builder, diff []DiffLine, indent string, maxWidth int) {
 	for _, d := range diff {
 		switch d.Op {
@@ -2035,37 +1391,7 @@ func renderDiffLines(b *strings.Builder, diff []DiffLine, indent string, maxWidt
 	}
 }
 
-func extractHeredocContent(lines []string) []string {
-	result := make([]string, 0, len(lines))
-	for _, line := range lines {
-		result = append(result, strings.TrimRight(line, " \t"))
-	}
-	return result
-}
-
-func extractPrefixedContent(lines []string, prefix string) []string {
-	result := make([]string, 0, len(lines))
-	for _, line := range lines {
-		trimmed := strings.TrimLeft(line, " \t")
-		if strings.HasPrefix(trimmed, prefix) {
-			result = append(result, trimmed[len(prefix):])
-		}
-	}
-	return result
-}
-
-func extractIndent(line string) string {
-	trimmed := strings.TrimLeft(line, " \t")
-	return line[:len(line)-len(trimmed)]
-}
-
-func unquote(s string) string {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1]
-	}
-	return s
-}
-
+// wrapText word-wraps s to width, used by renderDiffLines for long diff lines.
 func wrapText(s string, width int) string {
 	if width <= 10 {
 		return s
@@ -2073,8 +1399,290 @@ func wrapText(s string, width int) string {
 	return wordwrap.String(s, width)
 }
 
+// isMultilineStringAttr reports whether a leaf string attribute's old or
+// new value spans multiple lines (e.g. a Helm values YAML blob or a
+// cloud-init script) — these get line-by-line diffing instead of being
+// shown as one opaque blob.
+func isMultilineStringAttr(attr tfplan.Attribute) bool {
+	if attr.Kind != tfplan.KindString {
+		return false
+	}
+	if s, ok := attr.Old.(string); ok && strings.Contains(s, "\n") {
+		return true
+	}
+	if s, ok := attr.New.(string); ok && strings.Contains(s, "\n") {
+		return true
+	}
+	return false
+}
+
+// renderMultilineStringDiff renders a multi-line string attribute as a
+// "<<EOT ... EOT" block with its content diffed line-by-line. Unlike the
+// old heredoc-marker text scanning this replaces, there's no marker
+// detection needed at all: JSON strings are just strings.
+func (m Model) renderMultilineStringDiff(attr tfplan.Attribute, indent string, keyed bool, maxWidth int) string {
+	var b strings.Builder
+	var header string
+	if keyed {
+		header = indent + actionPrefixSymbol(attr.Action) + " " + attrNameStyle.Render(attr.Name) + " = " + mutedColor.Render("<<EOT")
+	} else {
+		header = indent + actionPrefixSymbol(attr.Action) + " " + mutedColor.Render("<<EOT")
+	}
+	b.WriteString(header)
+	b.WriteString("\n")
+
+	contentIndent := indent + "  "
+
+	if attr.Sensitive {
+		b.WriteString(contentIndent)
+		b.WriteString(lipgloss.NewStyle().Foreground(replaceColor).Italic(true).Render("(sensitive value)"))
+		b.WriteString("\n")
+		b.WriteString(indent + mutedColor.Render("EOT"))
+		return b.String()
+	}
+	if attr.Computed {
+		b.WriteString(contentIndent)
+		b.WriteString(attrComputedStyle.Render("(known after apply)"))
+		b.WriteString("\n")
+		b.WriteString(indent + mutedColor.Render("EOT"))
+		return b.String()
+	}
+
+	oldStr, _ := attr.Old.(string)
+	newStr, _ := attr.New.(string)
+
+	switch attr.Action {
+	case tfplan.ActionCreate:
+		for _, l := range strings.Split(newStr, "\n") {
+			b.WriteString(contentIndent)
+			b.WriteString(lipgloss.NewStyle().Foreground(createColor).Render("+ " + l))
+			b.WriteString("\n")
+		}
+	case tfplan.ActionDelete:
+		for _, l := range strings.Split(oldStr, "\n") {
+			b.WriteString(contentIndent)
+			b.WriteString(lipgloss.NewStyle().Foreground(destroyColor).Render("- " + l))
+			b.WriteString("\n")
+		}
+	case tfplan.ActionNoOp:
+		for _, l := range strings.Split(newStr, "\n") {
+			b.WriteString(contentIndent)
+			b.WriteString(mutedColor.Render("  " + l))
+			b.WriteString("\n")
+		}
+	default: // update
+		diff := ComputeDiff(strings.Split(oldStr, "\n"), strings.Split(newStr, "\n"))
+		contextDiff := ContextDiff(diff, m.diffContextSize())
+		if contextDiff == nil {
+			b.WriteString(contentIndent)
+			b.WriteString(mutedColor.Render("  (no changes)"))
+			b.WriteString("\n")
+		} else {
+			renderDiffLines(&b, contextDiff, contentIndent, maxWidth)
+		}
+	}
+
+	b.WriteString(indent + mutedColor.Render("EOT"))
+	return b.String()
+}
+
+// tryRenderUserdataAttr detects user_data/user_data_base64 attributes and
+// renders them decoded, with the decoded content diffed on change. The
+// trigger is now a simple name check on structured data, replacing the
+// old " = "-splitting text parse.
+func (m Model) tryRenderUserdataAttr(attr tfplan.Attribute, indent string, maxWidth int) (string, bool) {
+	if attr.Kind != tfplan.KindString || attr.Sensitive {
+		return "", false
+	}
+	if attr.Name != "user_data" && attr.Name != "user_data_base64" {
+		return "", false
+	}
+
+	oldB64, _ := attr.Old.(string)
+	newB64, _ := attr.New.(string)
+	oldDecoded, oldOk := TryDecodeUserdata(oldB64)
+	newDecoded, newOk := TryDecodeUserdata(newB64)
+	if !oldOk && !newOk {
+		return "", false
+	}
+
+	decodedIndent := indent + "  "
+	var b strings.Builder
+	b.WriteString(indent + actionPrefixSymbol(attr.Action) + " " + renderKeyValue(attr, true))
+	b.WriteString("\n")
+	b.WriteString(decodedIndent)
+	b.WriteString(mutedColor.Render("┄┄┄ decoded " + attr.Name + " ┄┄┄"))
+	b.WriteString("\n")
+
+	switch {
+	case oldOk && newOk:
+		diff := ComputeDiff(strings.Split(oldDecoded, "\n"), strings.Split(newDecoded, "\n"))
+		contextDiff := ContextDiff(diff, m.diffContextSize())
+		if contextDiff == nil {
+			b.WriteString(decodedIndent)
+			b.WriteString(mutedColor.Render("  (no changes in decoded content)"))
+			b.WriteString("\n")
+		} else {
+			renderDiffLines(&b, contextDiff, decodedIndent, maxWidth)
+		}
+	case oldOk:
+		for _, l := range strings.Split(oldDecoded, "\n") {
+			b.WriteString(decodedIndent)
+			b.WriteString(lipgloss.NewStyle().Foreground(destroyColor).Render("- " + l))
+			b.WriteString("\n")
+		}
+	case newOk:
+		for _, l := range strings.Split(newDecoded, "\n") {
+			b.WriteString(decodedIndent)
+			b.WriteString(lipgloss.NewStyle().Foreground(createColor).Render("+ " + l))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString(decodedIndent)
+	b.WriteString(mutedColor.Render("┄┄┄ end " + attr.Name + " ┄┄┄"))
+	return b.String(), true
+}
+
+// renderLeafRow renders one "name = value" (or bare "value") row for a
+// plain scalar attribute, word-wrapping long create/delete/unchanged
+// values (update rows, with their old → new arrow, are left unwrapped —
+// splitting two colored segments across lines isn't worth the added
+// complexity for what's a cosmetic nicety).
+func (m Model) renderLeafRow(indent string, attr tfplan.Attribute, keyed bool, maxWidth int) string {
+	prefix := actionPrefixSymbol(attr.Action)
+	rowPrefix := indent + prefix + " "
+	full := rowPrefix + renderKeyValue(attr, keyed)
+
+	if maxWidth <= 0 || attr.Action == tfplan.ActionUpdate || attr.Sensitive || attr.Computed || !keyed {
+		return full
+	}
+
+	plainValue := renderScalarText(attr.New)
+	styled := attrNewValueStyle
+	if attr.Action == tfplan.ActionDelete {
+		plainValue = renderScalarText(attr.Old)
+		styled = attrOldValueStyle
+	}
+
+	available := maxWidth - utf8.RuneCountInString(rowPrefix) - utf8.RuneCountInString(attr.Name) - 3
+	if available < 20 || utf8.RuneCountInString(plainValue) <= available {
+		return full
+	}
+
+	wrapped := wordwrap.String(plainValue, available)
+	subLines := strings.Split(wrapped, "\n")
+	if len(subLines) <= 1 {
+		return full
+	}
+
+	continuation := indent + strings.Repeat(" ", utf8.RuneCountInString(prefix)+1)
+	var b strings.Builder
+	for i, sub := range subLines {
+		if i > 0 {
+			b.WriteString("\n")
+			b.WriteString(continuation)
+		} else {
+			b.WriteString(rowPrefix)
+			b.WriteString(attrNameStyle.Render(attr.Name))
+			b.WriteString(" = ")
+		}
+		b.WriteString(styled.Render(sub))
+	}
+	return b.String()
+}
+
+// renderAttributeTree recursively renders a resource's (or a container
+// attribute's) children, applying fold state, multiline-string diffing,
+// userdata decoding, and sensitive/computed styling. keyed controls
+// whether each attribute prints its own "name = " prefix: true for
+// resource-level attributes and map entries, false for positional list
+// elements. foldIdx and lineCount are threaded through so the caller can
+// track blockCursor position and total rendered line count exactly as
+// before.
+//
+// Terraform's JSON plan always carries the resource's full before/after
+// state, not just the diff, so most attributes of a partially-changed
+// resource are unchanged context rather than part of the actual change.
+// Showing every one of them individually — even muted — buries the real
+// diff and is exactly what confused review of real-world plans. Terraform
+// CLI's own text renderer solves this by collapsing runs of unchanged
+// attributes into a single "# (N unchanged attributes hidden)" note; this
+// mirrors that convention rather than rendering them one by one.
+func (m *Model) renderAttributeTree(b *strings.Builder, address string, attrs []tfplan.Attribute, depth int, keyed bool, selected bool, foldIdx *int, lineCount *int) {
+	maxWidth := m.viewport.Width
+	indent := strings.Repeat("  ", depth)
+
+	for i := 0; i < len(attrs); i++ {
+		attr := attrs[i]
+
+		if attr.Action == tfplan.ActionNoOp {
+			run := 1
+			for i+run < len(attrs) && attrs[i+run].Action == tfplan.ActionNoOp {
+				run++
+			}
+			b.WriteString(indent + mutedColor.Render(unchangedHiddenNote(run)))
+			b.WriteString("\n")
+			*lineCount++
+			i += run - 1
+			continue
+		}
+
+		if keyed {
+			if decoded, ok := m.tryRenderUserdataAttr(attr, indent, maxWidth); ok {
+				b.WriteString(decoded)
+				b.WriteString("\n")
+				*lineCount += strings.Count(decoded, "\n") + 1
+				continue
+			}
+		}
+
+		if isContainerAttr(attr) {
+			key := foldKey(address, attr.Path)
+			collapsed := m.resolveCollapsed(key, countRenderedLines(attr))
+			blockSelected := selected && *foldIdx == m.blockCursor
+			if blockSelected {
+				m.selectedLineStart = *lineCount
+			}
+			b.WriteString(m.renderContainerHeader(indent, attr, keyed, collapsed, blockSelected, maxWidth))
+			b.WriteString("\n")
+			*lineCount++
+			*foldIdx++
+
+			if !collapsed {
+				childKeyed := attr.Kind == tfplan.KindMap
+				m.renderAttributeTree(b, address, attr.Children, depth+1, childKeyed, selected, foldIdx, lineCount)
+				b.WriteString(closingBraceLine(indent, attr.Kind))
+				b.WriteString("\n")
+				*lineCount++
+			}
+			continue
+		}
+
+		if attr.Sensitive {
+			row := indent + actionPrefixSymbol(attr.Action) + " " + renderKeyValue(attr, keyed)
+			b.WriteString(row)
+			b.WriteString("\n")
+			*lineCount++
+			continue
+		}
+
+		if isMultilineStringAttr(attr) {
+			rendered := m.renderMultilineStringDiff(attr, indent, keyed, maxWidth)
+			b.WriteString(rendered)
+			b.WriteString("\n")
+			*lineCount += strings.Count(rendered, "\n") + 1
+			continue
+		}
+
+		row := m.renderLeafRow(indent, attr, keyed, maxWidth)
+		b.WriteString(row)
+		b.WriteString("\n")
+		*lineCount += strings.Count(row, "\n") + 1
+	}
+}
+
 // renderSelectedResourceLine renders a resource line with full-width background highlight
-func (m Model) renderSelectedResourceLine(r parser.Resource, expanded bool, _ bool) string {
+func (m Model) renderSelectedResourceLine(r tfplan.Resource, expanded bool, _ bool) string {
 	// Build the line content
 	var content strings.Builder
 
@@ -2088,16 +1696,18 @@ func (m Model) renderSelectedResourceLine(r parser.Resource, expanded bool, _ bo
 
 	// Action symbol
 	switch r.Action {
-	case parser.ActionCreate:
+	case tfplan.ActionCreate:
 		content.WriteString("+")
-	case parser.ActionDestroy:
+	case tfplan.ActionDelete:
 		content.WriteString("-")
-	case parser.ActionUpdate:
+	case tfplan.ActionUpdate:
 		content.WriteString("~")
-	case parser.ActionReplace, parser.ActionDeleteCreate, parser.ActionCreateDelete:
+	case tfplan.ActionReplace:
 		content.WriteString("±")
-	case parser.ActionRead:
+	case tfplan.ActionRead:
 		content.WriteString("≤")
+	case tfplan.ActionForget:
+		content.WriteString("⊘")
 	default:
 		content.WriteString("~")
 	}
@@ -2107,13 +1717,13 @@ func (m Model) renderSelectedResourceLine(r parser.Resource, expanded bool, _ bo
 	content.WriteString(r.Address)
 
 	// Action description
-	actionDesc := getActionDescription(r.Action)
+	actionDesc := getActionDescription(r)
 	content.WriteString(" ")
 	content.WriteString(actionDesc)
 
-	// Line count
-	if len(r.RawLines) > 1 {
-		content.WriteString(fmt.Sprintf(" (%d lines)", len(r.RawLines)-1))
+	// Change count
+	if n := r.ChangedAttributeCount(); n > 0 {
+		fmt.Fprintf(&content, " (%d changes)", n)
 	}
 
 	// Pad to full width and apply selected style with foreground color
@@ -2132,7 +1742,7 @@ func (m Model) renderSelectedResourceLine(r parser.Resource, expanded bool, _ bo
 	return actionStyle.Render(line)
 }
 
-func (m Model) renderResourceLine(r parser.Resource, expanded bool, isMatch bool) string {
+func (m Model) renderResourceLine(r tfplan.Resource, expanded bool, isMatch bool) string {
 	var b strings.Builder
 
 	// Expand/collapse indicator
@@ -2159,127 +1769,16 @@ func (m Model) renderResourceLine(r parser.Resource, expanded bool, isMatch bool
 	b.WriteString(style.Render(address))
 
 	// Action description
-	actionDesc := getActionDescription(r.Action)
+	actionDesc := getActionDescription(r)
 	b.WriteString(" ")
 	b.WriteString(mutedColor.Render(actionDesc))
 
-	// Line count for expanded content
-	if len(r.RawLines) > 1 {
-		b.WriteString(mutedColor.Render(fmt.Sprintf(" (%d lines)", len(r.RawLines)-1)))
+	// Change count for expanded content
+	if n := r.ChangedAttributeCount(); n > 0 {
+		b.WriteString(mutedColor.Render(fmt.Sprintf(" (%d changes)", n)))
 	}
 
 	return b.String()
-}
-
-// colorizeHCLLine applies syntax highlighting to a line of HCL in the TUI.
-// The line-level prefix (+/-/~) drives content coloring instead of the
-// resource-level action, so + lines are green and - lines are red even
-// inside an "update" resource.
-func (m Model) colorizeHCLLine(line string, action parser.Action) string {
-	trimmed := strings.TrimLeft(line, " \t")
-	indent := line[:len(line)-len(trimmed)]
-
-	var prefix string
-	var content string
-	lineAction := action
-
-	if strings.HasPrefix(trimmed, "+ ") {
-		prefix = createSymbol
-		content = trimmed[2:]
-		lineAction = parser.ActionCreate
-	} else if strings.HasPrefix(trimmed, "- ") {
-		prefix = destroySymbol
-		content = trimmed[2:]
-		lineAction = parser.ActionDestroy
-	} else if strings.HasPrefix(trimmed, "~ ") {
-		prefix = updateSymbol
-		content = trimmed[2:]
-		lineAction = parser.ActionUpdate
-	} else {
-		prefix = " "
-		content = trimmed
-	}
-
-	coloredContent := m.colorizeHCLContent(content, lineAction)
-
-	return indent + prefix + " " + coloredContent
-}
-
-// colorizeHCLContent applies HCL syntax highlighting to content
-func (m Model) colorizeHCLContent(content string, action parser.Action) string {
-	// Empty or structural lines
-	if content == "" || content == "{" || content == "}" || content == "]" || content == "[" {
-		return mutedColor.Render(content)
-	}
-
-	// Check for key = value pattern
-	if idx := strings.Index(content, " = "); idx > 0 {
-		key := content[:idx]
-		value := content[idx+3:]
-		return attrNameStyle.Render(key) + " = " + m.colorizeValue(value, action)
-	}
-
-	// Nested block headers (e.g., "root_block_device {")
-	if strings.HasSuffix(content, " {") {
-		blockName := strings.TrimSuffix(content, " {")
-		return lipgloss.NewStyle().Foreground(headerColor).Render(blockName) + " {"
-	}
-
-	// Resource declarations
-	if strings.HasPrefix(content, "resource ") || strings.HasPrefix(content, "data ") {
-		return lipgloss.NewStyle().Foreground(replaceColor).Bold(true).Render(content)
-	}
-
-	// Default
-	return attrNameStyle.Render(content)
-}
-
-// colorizeValue applies coloring to a value based on its type
-func (m Model) colorizeValue(value string, action parser.Action) string {
-	value = strings.TrimSpace(value)
-
-	// (known after apply)
-	if strings.Contains(value, "(known after apply)") {
-		return attrComputedStyle.Render(value)
-	}
-
-	// (sensitive value)
-	if strings.Contains(value, "(sensitive") {
-		return lipgloss.NewStyle().Foreground(replaceColor).Italic(true).Render(value)
-	}
-
-	// Change arrow: old -> new
-	if strings.Contains(value, " -> ") {
-		parts := strings.SplitN(value, " -> ", 2)
-		oldVal := strings.TrimSpace(parts[0])
-		newVal := strings.TrimSpace(parts[1])
-		return attrOldValueStyle.Render(oldVal) + " → " + attrNewValueStyle.Render(newVal)
-	}
-
-	// null
-	if value == "null" {
-		return lipgloss.NewStyle().Foreground(destroyColor).Render(value)
-	}
-
-	// boolean
-	if value == "true" || value == "false" {
-		return lipgloss.NewStyle().Foreground(readColor).Render(value)
-	}
-
-	// Structural
-	if value == "{" || value == "[" || strings.HasSuffix(value, "{") || strings.HasSuffix(value, "[") {
-		return mutedColor.Render(value)
-	}
-
-	// Default based on action
-	switch action {
-	case parser.ActionCreate:
-		return attrNewValueStyle.Render(value)
-	case parser.ActionDestroy:
-		return attrOldValueStyle.Render(value)
-	default:
-		return lipgloss.NewStyle().Foreground(textColor).Render(value)
-	}
 }
 
 func highlightMatch(text, query string) string {
@@ -2298,23 +1797,28 @@ func highlightMatch(text, query string) string {
 	return before + matchStyle.Render(match) + after
 }
 
-func getActionDescription(action parser.Action) string {
-	switch action {
-	case parser.ActionCreate:
+// getActionDescription returns the human-readable description shown next
+// to a resource's address, distinguishing the two replace orderings via
+// ReplacePattern the way the legacy delete-create/create-delete actions
+// used to.
+func getActionDescription(r tfplan.Resource) string {
+	switch r.Action {
+	case tfplan.ActionCreate:
 		return "will be created"
-	case parser.ActionDestroy:
+	case tfplan.ActionDelete:
 		return "will be destroyed"
-	case parser.ActionUpdate:
+	case tfplan.ActionUpdate:
 		return "will be updated"
-	case parser.ActionReplace:
-		return "must be replaced"
-	case parser.ActionRead:
-		return "will be read"
-	case parser.ActionDeleteCreate:
+	case tfplan.ActionReplace:
+		if r.ReplacePattern == tfplan.ReplaceCreateBeforeDestroy {
+			return "will be created and then destroyed"
+		}
 		return "will be destroyed and then created"
-	case parser.ActionCreateDelete:
-		return "will be created and then destroyed"
-	case parser.ActionOutput:
+	case tfplan.ActionRead:
+		return "will be read"
+	case tfplan.ActionForget:
+		return "will be removed from state"
+	case tfplan.ActionOutput:
 		return "output values will change"
 	default:
 		return ""
@@ -2354,23 +1858,21 @@ func sortOrderHint(opt SortOrder) string {
 }
 
 // filterActionLabel returns a short label for the filter picker
-func filterActionLabel(action parser.Action) string {
+func filterActionLabel(action tfplan.Action) string {
 	switch action {
-	case parser.ActionCreate:
+	case tfplan.ActionCreate:
 		return "create"
-	case parser.ActionDestroy:
+	case tfplan.ActionDelete:
 		return "destroy"
-	case parser.ActionUpdate:
+	case tfplan.ActionUpdate:
 		return "update"
-	case parser.ActionReplace:
+	case tfplan.ActionReplace:
 		return "replace"
-	case parser.ActionRead:
+	case tfplan.ActionRead:
 		return "read"
-	case parser.ActionDeleteCreate:
-		return "destroy+create"
-	case parser.ActionCreateDelete:
-		return "create+destroy"
-	case parser.ActionOutput:
+	case tfplan.ActionForget:
+		return "forget"
+	case tfplan.ActionOutput:
 		return "output"
 	default:
 		return string(action)
@@ -2429,23 +1931,17 @@ func (m Model) viewHeader() string {
 	var b strings.Builder
 	b.WriteString(headerStyle.Render("🔺 Terra-Prism - Terraform Plan Viewer"))
 	b.WriteString("\n")
-	if m.plan.Summary != "" {
-		summary := fmt.Sprintf("  %s to add, %s to change, %s to destroy",
-			lipgloss.NewStyle().Foreground(createColor).Render(fmt.Sprintf("%d", m.plan.TotalAdd)),
-			lipgloss.NewStyle().Foreground(updateColor).Render(fmt.Sprintf("%d", m.plan.TotalChange)),
-			lipgloss.NewStyle().Foreground(destroyColor).Render(fmt.Sprintf("%d", m.plan.TotalDestroy)),
+	summary := fmt.Sprintf("  %s to add, %s to change, %s to destroy",
+		lipgloss.NewStyle().Foreground(createColor).Render(fmt.Sprintf("%d", m.plan.TotalAdd)),
+		lipgloss.NewStyle().Foreground(updateColor).Render(fmt.Sprintf("%d", m.plan.TotalChange)),
+		lipgloss.NewStyle().Foreground(destroyColor).Render(fmt.Sprintf("%d", m.plan.TotalDestroy)),
+	)
+	if m.plan.OutputCount > 0 {
+		summary += fmt.Sprintf(", %s output(s) changed",
+			lipgloss.NewStyle().Foreground(updateColor).Render(fmt.Sprintf("%d", m.plan.OutputCount)),
 		)
-		if m.plan.OutputCount > 0 {
-			summary += fmt.Sprintf(", %s output(s) changed",
-				lipgloss.NewStyle().Foreground(updateColor).Render(fmt.Sprintf("%d", m.plan.OutputCount)),
-			)
-		}
-		b.WriteString(summaryStyle.Render(summary))
-	} else if m.plan.OutputCount > 0 {
-		b.WriteString(summaryStyle.Render(fmt.Sprintf("  %d output(s) changed", m.plan.OutputCount)))
-	} else {
-		b.WriteString(summaryStyle.Render(fmt.Sprintf("  %d resources with changes", len(m.plan.Resources))))
 	}
+	b.WriteString(summaryStyle.Render(summary))
 	b.WriteString("\n\n")
 	return b.String()
 }
