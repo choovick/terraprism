@@ -423,13 +423,8 @@ func handleKeyUp(m Model) (Model, tea.Cmd, bool) {
 		}
 		m.updateViewportContent()
 		m.ensureCursorVisible()
-	} else if m.cursorLineVisible() {
-		m.viewport.SetYOffset(m.viewport.YOffset - 1)
 	} else {
-		// Already at the first item, but the mouse wheel scrolled the
-		// view away from it — snap back rather than nudging one line at
-		// a time toward a cursor that isn't going to move.
-		m.ensureCursorVisible()
+		m.scrollPastBoundary(false)
 	}
 	return m, nil, true
 }
@@ -441,10 +436,8 @@ func (m Model) handleSearchArrowUp() Model {
 		m.blockCursor = -1
 		m.updateViewportContent()
 		m.ensureCursorVisible()
-	} else if m.cursorLineVisible() {
-		m.viewport.SetYOffset(m.viewport.YOffset - 1)
 	} else {
-		m.ensureCursorVisible()
+		m.scrollPastBoundary(false)
 	}
 	return m
 }
@@ -457,10 +450,8 @@ func (m Model) handleSearchArrowDown() Model {
 		m.blockCursor = -1
 		m.updateViewportContent()
 		m.ensureCursorVisible()
-	} else if m.cursorLineVisible() {
-		m.viewport.SetYOffset(m.viewport.YOffset + 1)
 	} else {
-		m.ensureCursorVisible()
+		m.scrollPastBoundary(true)
 	}
 	return m
 }
@@ -483,11 +474,7 @@ func handleKeyDown(m Model) (Model, tea.Cmd, bool) {
 		// At the last resource's own row (not inside its fold
 		// hierarchy): free-scroll past it to reveal the "End of Plan"
 		// footer, or snap back if the mouse wheel scrolled away.
-		if m.cursorLineVisible() {
-			m.viewport.SetYOffset(m.viewport.YOffset + 1)
-		} else {
-			m.ensureCursorVisible()
-		}
+		m.scrollPastBoundary(true)
 	} else if !m.cursorLineVisible() {
 		// Stuck at the last fold block of the last resource — nothing
 		// left to select — but the mouse wheel scrolled the view away
@@ -1155,6 +1142,36 @@ func (m *Model) cursorLineVisible() bool {
 	topLine := m.viewport.YOffset
 	bottomLine := topLine + m.viewport.Height - 1
 	return lineNum >= topLine && lineNum <= bottomLine
+}
+
+// scrollPastBoundary handles a keypress that can't move the cursor any
+// further (already at the first/last item) by either free-scrolling one
+// line past the edge or snapping back to the cursor, depending on
+// whether the mouse wheel has scrolled the view away from it.
+//
+// Free-scrolling stops for good once the selected line reaches the near
+// edge of the viewport in the direction of travel, rather than
+// continuing until the line is pushed just out of view: cursorLineVisible
+// treats a line sitting exactly on the boundary as still visible, so
+// scrolling one more line makes it invisible, which would make the very
+// next press's "not visible -> snap back" case immediately undo the
+// scroll — an unstable two-step oscillation instead of a settled state.
+func (m *Model) scrollPastBoundary(down bool) {
+	if !m.cursorLineVisible() {
+		m.ensureCursorVisible()
+		return
+	}
+	topLine := m.viewport.YOffset
+	bottomLine := topLine + m.viewport.Height - 1
+	if down {
+		if m.selectedLineStart > topLine {
+			m.viewport.SetYOffset(topLine + 1)
+		}
+		return
+	}
+	if m.selectedLineStart < bottomLine {
+		m.viewport.SetYOffset(topLine - 1)
+	}
 }
 
 // scrollForExpanded ensures the cursor is visible and, when expanded,

@@ -106,6 +106,50 @@ func TestBoundaryKeyFreeScrollsWhenAlreadyAtCursor(t *testing.T) {
 	}
 }
 
+// Regression: repeatedly free-scrolling past the last item used to enter
+// an unstable two-value oscillation instead of settling. Once the
+// viewport's top line advances to exactly match the selected line,
+// cursorLineVisible reports the line as still visible (it's the top edge
+// of the visible range), so the old "free-scroll by one more line while
+// visible" branch scrolled one line past it — which made the line
+// invisible on the very next press, triggering a snap-back to the exact
+// offset it had just left, then immediately free-scrolling past it
+// again, forever. It must instead settle with the selected line pinned
+// at the top of the viewport and stop.
+func TestFreeScrollPastLastItemSettlesWithoutOscillating(t *testing.T) {
+	plan := manyResourcesPlan(40)
+	m := NewModel(plan, "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	mm := model.(Model)
+
+	for i := 0; i < len(plan.Resources)-1; i++ {
+		model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+		mm = model.(Model)
+	}
+
+	var offsets []int
+	for i := 0; i < 60; i++ {
+		model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+		mm = model.(Model)
+		offsets = append(offsets, mm.viewport.YOffset)
+		if !mm.cursorLineVisible() {
+			t.Fatalf("press #%d: selection scrolled out of view (YOffset=%d, selectedLineStart=%d)",
+				i+1, mm.viewport.YOffset, mm.selectedLineStart)
+		}
+	}
+
+	last := offsets[len(offsets)-1]
+	for i := len(offsets) - 10; i < len(offsets); i++ {
+		if offsets[i] != last {
+			t.Fatalf("viewport did not settle, still changing after 50+ presses: %v", offsets[len(offsets)-15:])
+		}
+	}
+	if mm.selectedLineStart != last {
+		t.Fatalf("expected the selected line to settle pinned at the top of the viewport (YOffset=%d), got selectedLineStart=%d",
+			last, mm.selectedLineStart)
+	}
+}
+
 // Regression: reaching the last fold block of an expanded resource that
 // is itself the last (or only) displayed resource used to keep
 // free-scrolling the viewport by one line per keypress even though the
