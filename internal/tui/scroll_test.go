@@ -105,3 +105,65 @@ func TestBoundaryKeyFreeScrollsWhenAlreadyAtCursor(t *testing.T) {
 		t.Fatalf("expected free-scroll by exactly one line past the last item, got YOffset %d -> %d", before, mm.viewport.YOffset)
 	}
 }
+
+// Regression: reaching the last fold block of an expanded resource that
+// is itself the last (or only) displayed resource used to keep
+// free-scrolling the viewport by one line per keypress even though the
+// selected block had stopped changing — because the "free-scroll past
+// the boundary" branch didn't distinguish "stuck at the plain resource
+// row" (where free-scroll reveals the End-of-Plan footer, a real
+// feature) from "stuck deep inside a fold hierarchy with nothing further
+// to select" (where further scrolling only drifts the view away from a
+// selection that isn't moving). Once truly stuck at the last fold block,
+// further 'j' presses must be a no-op.
+func TestLastFoldBlockOfLastResourceStopsScrollingOnceStuck(t *testing.T) {
+	nested := mapBlock("values", tfplan.ActionUpdate,
+		leaf("replicaCount", tfplan.ActionUpdate, tfplan.KindNumber, "2", "3"))
+	metadata := mapBlock("metadata", tfplan.ActionUpdate, nested)
+
+	resources := []tfplan.Resource{
+		{Address: "helm_release.only", Action: tfplan.ActionUpdate, Attributes: withPaths([]tfplan.Attribute{metadata}, "")},
+	}
+	plan := &tfplan.Plan{Resources: resources}
+
+	m := NewModel(plan, "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	mm := model.(Model)
+
+	model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter}) // expand the resource
+	mm = model.(Model)
+	model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")}) // expand its sub-blocks
+	mm = model.(Model)
+
+	blocks := mm.currentFoldBlocks()
+	if len(blocks) == 0 {
+		t.Fatalf("expected at least one fold block")
+	}
+
+	// Step down to the last fold block.
+	for i := 0; i < len(blocks); i++ {
+		model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+		mm = model.(Model)
+	}
+	if mm.blockCursor != len(blocks)-1 {
+		t.Fatalf("expected blockCursor at the last block (%d), got %d", len(blocks)-1, mm.blockCursor)
+	}
+	stuckOffset := mm.viewport.YOffset
+	stuckSelectedLine := mm.selectedLineStart
+
+	// Further 'j' presses must not move the viewport or the selection —
+	// there's nothing left to select.
+	for i := 0; i < 5; i++ {
+		model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+		mm = model.(Model)
+		if mm.blockCursor != len(blocks)-1 {
+			t.Fatalf("blockCursor should stay at the last block, got %d", mm.blockCursor)
+		}
+		if mm.viewport.YOffset != stuckOffset {
+			t.Fatalf("viewport should stop scrolling once stuck at the last block, got YOffset %d -> %d", stuckOffset, mm.viewport.YOffset)
+		}
+		if mm.selectedLineStart != stuckSelectedLine {
+			t.Fatalf("selectedLineStart should stay put once stuck, got %d -> %d", stuckSelectedLine, mm.selectedLineStart)
+		}
+	}
+}

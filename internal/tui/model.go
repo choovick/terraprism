@@ -479,12 +479,21 @@ func handleKeyDown(m Model) (Model, tea.Cmd, bool) {
 		m.blockCursor = -1
 		m.updateViewportContent()
 		m.ensureCursorVisible()
-	} else if m.cursorLineVisible() {
-		m.viewport.SetYOffset(m.viewport.YOffset + 1)
-	} else {
-		// Already at the last item, but the mouse wheel scrolled the
-		// view away from it — snap back rather than nudging one line at
-		// a time toward a cursor that isn't going to move.
+	} else if m.blockCursor < 0 {
+		// At the last resource's own row (not inside its fold
+		// hierarchy): free-scroll past it to reveal the "End of Plan"
+		// footer, or snap back if the mouse wheel scrolled away.
+		if m.cursorLineVisible() {
+			m.viewport.SetYOffset(m.viewport.YOffset + 1)
+		} else {
+			m.ensureCursorVisible()
+		}
+	} else if !m.cursorLineVisible() {
+		// Stuck at the last fold block of the last resource — nothing
+		// left to select — but the mouse wheel scrolled the view away
+		// from it; snap back rather than free-scrolling further, which
+		// would just drift the view away from a selection that isn't
+		// moving.
 		m.ensureCursorVisible()
 	}
 	return m, nil, true
