@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -149,6 +150,61 @@ func TestMultilineStringRendersAsSingleDiffBlock(t *testing.T) {
 	}
 	if !strings.Contains(got, "replicaCount: 2") || !strings.Contains(got, "replicaCount: 3") {
 		t.Fatalf("expected both old and new content visible:\n%s", got)
+	}
+}
+
+// Large multi-line string diffs must be foldable, the same way large
+// containers are: this regressed when multiline rendering was first
+// introduced (always fully expanded, no collapse indicator at all).
+func TestLargeMultilineStringDiffIsFoldable(t *testing.T) {
+	var oldLines, newLines []string
+	for i := 0; i < 40; i++ {
+		oldLines = append(oldLines, fmt.Sprintf("line-%d: unchanged", i))
+		newLines = append(newLines, fmt.Sprintf("line-%d: unchanged", i))
+	}
+	newLines[20] = "line-20: changed"
+	attr := leaf("values", tfplan.ActionUpdate, tfplan.KindString,
+		strings.Join(oldLines, "\n"), strings.Join(newLines, "\n"))
+
+	r := tfplan.Resource{
+		Address:    "helm_release.chart",
+		Action:     tfplan.ActionUpdate,
+		Attributes: withPaths([]tfplan.Attribute{attr}, ""),
+	}
+
+	// Collapsed by default (40 lines exceeds defaultCollapsedFoldLines).
+	got := renderResourceForTest(r, 0)
+	if !strings.Contains(got, "▶ ~ values = <<EOT ... 40 lines") {
+		t.Fatalf("expected a collapsed fold header with a line-count summary:\n%s", got)
+	}
+	if strings.Contains(got, "line-0: unchanged") {
+		t.Fatalf("collapsed multiline content should be hidden:\n%s", got)
+	}
+
+	// Expanding it (via blockCursor + toggle) reveals the content and
+	// flips the indicator, exactly like a container fold.
+	m := Model{
+		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
+		expanded:     map[int]bool{0: true},
+		foldedBlocks: make(map[string]bool),
+		blockCursor:  0,
+		viewport:     viewport.New(120, 40),
+	}
+	if !m.setCurrentFoldCollapsed(false) {
+		t.Fatal("expected the multiline attribute to be a navigable fold block")
+	}
+
+	var b strings.Builder
+	foldIdx := 0
+	lineCount := 0
+	m.renderAttributeTree(&b, r.Address, r.Attributes, 0, true, false, &foldIdx, &lineCount)
+	expanded := stripRenderANSI(b.String())
+
+	if !strings.Contains(expanded, "▼ ~ values = <<EOT") {
+		t.Fatalf("expected an expanded fold header after toggling:\n%s", expanded)
+	}
+	if !strings.Contains(expanded, "line-20: unchanged") || !strings.Contains(expanded, "line-20: changed") {
+		t.Fatalf("expanded multiline content should show the diffed line:\n%s", expanded)
 	}
 }
 

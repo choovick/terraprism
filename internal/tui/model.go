@@ -1232,15 +1232,29 @@ func isDescendantPath(path, ancestorPath string) bool {
 }
 
 // isContainerAttr reports whether an attribute is a non-empty, non-sensitive
-// map or list — i.e. something that renders as a foldable block.
+// map or list — i.e. something that renders as a foldable block with
+// nested children.
 func isContainerAttr(a tfplan.Attribute) bool {
 	return (a.Kind == tfplan.KindMap || a.Kind == tfplan.KindList) && len(a.Children) > 0 && !a.Sensitive
 }
 
-// countRenderedLines estimates how many lines a container attribute would
-// take fully expanded (open + close + recursively every descendant),
-// used to decide the default collapsed/expanded state.
+// isFoldableAttr reports whether an attribute renders as a foldable block
+// at all — either a container (nested children) or a multi-line string
+// (diffed content with no children of its own). Both get an
+// expand/collapse indicator and a default-collapse-by-size heuristic;
+// only containers recurse into Children.
+func isFoldableAttr(a tfplan.Attribute) bool {
+	return isContainerAttr(a) || isMultilineStringAttr(a)
+}
+
+// countRenderedLines estimates how many lines a foldable attribute would
+// take fully expanded — open+close plus recursive descendants for a
+// container, or open+close plus diffed line count for a multi-line
+// string — used to decide the default collapsed/expanded state.
 func countRenderedLines(a tfplan.Attribute) int {
+	if isMultilineStringAttr(a) {
+		return multilineLineEstimate(a) + 2
+	}
 	if !isContainerAttr(a) {
 		return 1
 	}
@@ -1251,18 +1265,38 @@ func countRenderedLines(a tfplan.Attribute) int {
 	return n
 }
 
-// allFoldableAttributes returns every container attribute in the tree,
+// multilineLineEstimate returns the larger of the old/new value's line
+// count, for sizing the default-collapse heuristic and the collapsed
+// "... (N lines)" summary — doesn't need to be exact, just representative.
+func multilineLineEstimate(a tfplan.Attribute) int {
+	count := func(v any) int {
+		s, ok := v.(string)
+		if !ok {
+			return 0
+		}
+		return strings.Count(s, "\n") + 1
+	}
+	oldLines, newLines := count(a.Old), count(a.New)
+	if oldLines > newLines {
+		return oldLines
+	}
+	return newLines
+}
+
+// allFoldableAttributes returns every foldable attribute in the tree,
 // structurally, regardless of current fold state. Used by "expand/collapse
 // scope" operations, which must reach descendants even when an
 // intermediate ancestor happens to be currently collapsed.
 func allFoldableAttributes(address string, attrs []tfplan.Attribute, depth int) []foldBlock {
 	var blocks []foldBlock
 	for _, a := range attrs {
-		if !isContainerAttr(a) {
+		if !isFoldableAttr(a) {
 			continue
 		}
 		blocks = append(blocks, foldBlock{Key: foldKey(address, a.Path), Path: a.Path, Attr: a, Depth: depth})
-		blocks = append(blocks, allFoldableAttributes(address, a.Children, depth+1)...)
+		if isContainerAttr(a) {
+			blocks = append(blocks, allFoldableAttributes(address, a.Children, depth+1)...)
+		}
 	}
 	return blocks
 }
@@ -1273,12 +1307,12 @@ func allFoldableAttributes(address string, attrs []tfplan.Attribute, depth int) 
 func flattenFoldableAttributes(address string, attrs []tfplan.Attribute, depth int, isCollapsed func(key string, size int) bool) []foldBlock {
 	var blocks []foldBlock
 	for _, a := range attrs {
-		if !isContainerAttr(a) {
+		if !isFoldableAttr(a) {
 			continue
 		}
 		key := foldKey(address, a.Path)
 		blocks = append(blocks, foldBlock{Key: key, Path: a.Path, Attr: a, Depth: depth})
-		if !isCollapsed(key, countRenderedLines(a)) {
+		if isContainerAttr(a) && !isCollapsed(key, countRenderedLines(a)) {
 			blocks = append(blocks, flattenFoldableAttributes(address, a.Children, depth+1, isCollapsed)...)
 		}
 	}
@@ -1298,30 +1332,28 @@ func (m *Model) isFoldCollapsed(block foldBlock) bool {
 	return m.resolveCollapsed(block.Key, countRenderedLines(block.Attr))
 }
 
-// renderContainerHeader renders a fold block's header row: the
-// expand/collapse indicator, diff-action symbol, and "name = {"/"[" (or
-// just the bracket when keyed is false, i.e. a positional list element).
-func (m Model) renderContainerHeader(indent string, attr tfplan.Attribute, keyed, collapsed, selected bool, maxWidth int) string {
+// renderFoldHeader renders a fold block's header row: the expand/collapse
+// indicator, diff-action symbol, and "name = <opener>" (or just <opener>
+// when keyed is false, i.e. a positional list element), with
+// collapsedSummary appended when collapsed. Shared between container
+// attributes ("{"/"[" ... "N attrs/items }") and multi-line string
+// attributes ("<<EOT" ... "N lines") — the two foldable attribute shapes.
+func (m Model) renderFoldHeader(indent string, attr tfplan.Attribute, keyed, collapsed, selected bool, maxWidth int, opener, collapsedSummary string) string {
 	indicator := expandedIndicator
 	if collapsed {
 		indicator = collapsedIndicator
 	}
-	open, closeBracket := containerBrackets(attr.Kind)
 
 	var content string
 	if keyed {
-		content = attrNameStyle.Render(attr.Name) + " = " + mutedColor.Render(open)
+		content = attrNameStyle.Render(attr.Name) + " = " + mutedColor.Render(opener)
 	} else {
-		content = mutedColor.Render(open)
+		content = mutedColor.Render(opener)
 	}
 
 	result := indent + indicator + " " + actionPrefixSymbol(attr.Action) + " " + content
 	if collapsed {
-		noun := "attrs"
-		if attr.Kind == tfplan.KindList {
-			noun = "items"
-		}
-		result += mutedColor.Render(fmt.Sprintf(" ... %d %s %s", len(attr.Children), noun, closeBracket))
+		result += mutedColor.Render(" ... " + collapsedSummary)
 	}
 
 	if !selected {
@@ -1339,9 +1371,31 @@ func (m Model) renderContainerHeader(indent string, attr tfplan.Attribute, keyed
 	return lipgloss.NewStyle().Background(selectedBg).Foreground(textColor).Render(result)
 }
 
+// containerFoldSummary formats the "N attrs }" / "N items ]" text shown
+// after a collapsed container's opening bracket.
+func containerFoldSummary(attr tfplan.Attribute) string {
+	_, closeBracket := containerBrackets(attr.Kind)
+	noun := "attrs"
+	if attr.Kind == tfplan.KindList {
+		noun = "items"
+	}
+	return fmt.Sprintf("%d %s %s", len(attr.Children), noun, closeBracket)
+}
+
 func closingBraceLine(indent string, kind tfplan.ValueKind) string {
 	_, closeBracket := containerBrackets(kind)
 	return indent + mutedColor.Render(closeBracket)
+}
+
+// multilineFoldSummary formats the "N lines" text shown after a
+// collapsed multi-line string's opening "<<EOT" marker.
+func multilineFoldSummary(attr tfplan.Attribute) string {
+	n := multilineLineEstimate(attr)
+	noun := "line"
+	if n != 1 {
+		noun = "lines"
+	}
+	return fmt.Sprintf("%d %s", n, noun)
 }
 
 // unchangedHiddenNote formats the "# (N unchanged attributes hidden)"
@@ -1416,35 +1470,26 @@ func isMultilineStringAttr(attr tfplan.Attribute) bool {
 	return false
 }
 
-// renderMultilineStringDiff renders a multi-line string attribute as a
-// "<<EOT ... EOT" block with its content diffed line-by-line. Unlike the
-// old heredoc-marker text scanning this replaces, there's no marker
-// detection needed at all: JSON strings are just strings.
-func (m Model) renderMultilineStringDiff(attr tfplan.Attribute, indent string, keyed bool, maxWidth int) string {
+// renderMultilineStringBody renders a multi-line string attribute's
+// diffed content — no header, no "EOT" footer; the caller wraps this
+// with renderFoldHeader/closingBraceLine-equivalent lines so it folds
+// like any other collapsible block. Unlike the old heredoc-marker text
+// scanning this replaces, there's no marker detection needed at all:
+// JSON strings are just strings.
+func (m Model) renderMultilineStringBody(attr tfplan.Attribute, indent string, maxWidth int) string {
 	var b strings.Builder
-	var header string
-	if keyed {
-		header = indent + actionPrefixSymbol(attr.Action) + " " + attrNameStyle.Render(attr.Name) + " = " + mutedColor.Render("<<EOT")
-	} else {
-		header = indent + actionPrefixSymbol(attr.Action) + " " + mutedColor.Render("<<EOT")
-	}
-	b.WriteString(header)
-	b.WriteString("\n")
-
 	contentIndent := indent + "  "
 
 	if attr.Sensitive {
 		b.WriteString(contentIndent)
 		b.WriteString(lipgloss.NewStyle().Foreground(replaceColor).Italic(true).Render("(sensitive value)"))
 		b.WriteString("\n")
-		b.WriteString(indent + mutedColor.Render("EOT"))
 		return b.String()
 	}
 	if attr.Computed {
 		b.WriteString(contentIndent)
 		b.WriteString(attrComputedStyle.Render("(known after apply)"))
 		b.WriteString("\n")
-		b.WriteString(indent + mutedColor.Render("EOT"))
 		return b.String()
 	}
 
@@ -1482,7 +1527,6 @@ func (m Model) renderMultilineStringDiff(attr tfplan.Attribute, indent string, k
 		}
 	}
 
-	b.WriteString(indent + mutedColor.Render("EOT"))
 	return b.String()
 }
 
@@ -1643,7 +1687,8 @@ func (m *Model) renderAttributeTree(b *strings.Builder, address string, attrs []
 			if blockSelected {
 				m.selectedLineStart = *lineCount
 			}
-			b.WriteString(m.renderContainerHeader(indent, attr, keyed, collapsed, blockSelected, maxWidth))
+			open, _ := containerBrackets(attr.Kind)
+			b.WriteString(m.renderFoldHeader(indent, attr, keyed, collapsed, blockSelected, maxWidth, open, containerFoldSummary(attr)))
 			b.WriteString("\n")
 			*lineCount++
 			*foldIdx++
@@ -1667,10 +1712,25 @@ func (m *Model) renderAttributeTree(b *strings.Builder, address string, attrs []
 		}
 
 		if isMultilineStringAttr(attr) {
-			rendered := m.renderMultilineStringDiff(attr, indent, keyed, maxWidth)
-			b.WriteString(rendered)
+			key := foldKey(address, attr.Path)
+			collapsed := m.resolveCollapsed(key, countRenderedLines(attr))
+			blockSelected := selected && *foldIdx == m.blockCursor
+			if blockSelected {
+				m.selectedLineStart = *lineCount
+			}
+			b.WriteString(m.renderFoldHeader(indent, attr, keyed, collapsed, blockSelected, maxWidth, "<<EOT", multilineFoldSummary(attr)))
 			b.WriteString("\n")
-			*lineCount += strings.Count(rendered, "\n") + 1
+			*lineCount++
+			*foldIdx++
+
+			if !collapsed {
+				body := m.renderMultilineStringBody(attr, indent, maxWidth)
+				b.WriteString(body)
+				*lineCount += strings.Count(body, "\n")
+				b.WriteString(indent + mutedColor.Render("EOT"))
+				b.WriteString("\n")
+				*lineCount++
+			}
 			continue
 		}
 
