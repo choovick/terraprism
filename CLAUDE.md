@@ -58,6 +58,9 @@ golangci-lint run ./...
 
 ## Architecture Decisions
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for diagrams of package
+dependencies, data flow, and the plan data model.
+
 1. **Elm Architecture (TEA):** TUI follows Bubble Tea's Model-Update-View pattern
 2. **JSON-only, no regex parsing:** `internal/tfplan` decodes `terraform show -json` (via `hashicorp/terraform-json`) into a pre-diffed attribute tree; `internal/tui` renders that tree directly rather than re-parsing text
 3. **Runner separation:** `internal/runner` is the only place that shells out to `terraform`/`tofu` plan/show/apply, independent of TUI and decoding

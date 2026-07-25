@@ -388,7 +388,9 @@ Terra-Prism solves these problems:
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please feel free to submit a Pull Request. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for how the codebase is put together
+(package responsibilities, data flow, and the plan data model).
 
 ### Development
 
