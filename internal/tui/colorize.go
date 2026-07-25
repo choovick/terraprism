@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/charmbracelet/lipgloss"
-
 	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
 
@@ -51,29 +49,37 @@ func renderScalarText(v any) string {
 // yellow for numbers) made them visually compete with attributes that
 // actually changed. In practice renderAttributeTree filters no-op leaves
 // out into a "(N unchanged attributes hidden)" summary before they ever
-// reach here (matching Terraform's own CLI convention), so this case is
+// reach here (matching Terraform CLI's own convention), so this case is
 // a defensive fallback, not the primary path.
+//
+// Uses the fastStyle (precomputed-ANSI) variants rather than calling
+// lipgloss.Style.Render directly: this is the hottest call site in the
+// whole renderer (invoked once per leaf attribute), and a plan with a
+// few thousand attributes made the per-call cost of lipgloss's full
+// style-resolution pipeline add up to a user-visible stall on every
+// keystroke.
 func renderLeafValue(attr tfplan.Attribute) string {
 	if attr.Sensitive {
-		return lipgloss.NewStyle().Foreground(replaceColor).Italic(true).Render("(sensitive value)")
+		return fastSensitive.Render("(sensitive value)")
 	}
-	computedText := attrComputedStyle.Render("(known after apply)")
 
 	switch attr.Action {
 	case tfplan.ActionCreate:
 		if attr.Computed {
-			return computedText
+			return fastAttrComputed.Render("(known after apply)")
 		}
-		return attrNewValueStyle.Render(renderScalarText(attr.New))
+		return fastAttrNewValue.Render(renderScalarText(attr.New))
 	case tfplan.ActionDelete:
-		return attrOldValueStyle.Render(renderScalarText(attr.Old))
+		return fastAttrOldValue.Render(renderScalarText(attr.Old))
 	case tfplan.ActionNoOp:
-		return mutedColor.Render(renderScalarText(attr.New))
+		return fastMuted.Render(renderScalarText(attr.New))
 	default: // update
-		oldText := attrOldValueStyle.Render(renderScalarText(attr.Old))
-		newText := computedText
-		if !attr.Computed {
-			newText = attrNewValueStyle.Render(renderScalarText(attr.New))
+		oldText := fastAttrOldValue.Render(renderScalarText(attr.Old))
+		var newText string
+		if attr.Computed {
+			newText = fastAttrComputed.Render("(known after apply)")
+		} else {
+			newText = fastAttrNewValue.Render(renderScalarText(attr.New))
 		}
 		return oldText + " → " + newText
 	}
@@ -85,7 +91,7 @@ func renderKeyValue(attr tfplan.Attribute, keyed bool) string {
 	if !keyed {
 		return renderLeafValue(attr)
 	}
-	return attrNameStyle.Render(attr.Name) + " = " + renderLeafValue(attr)
+	return fastAttrName.Render(attr.Name) + " = " + renderLeafValue(attr)
 }
 
 // containerBrackets returns the open/close delimiters for a container

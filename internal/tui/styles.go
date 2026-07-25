@@ -2,9 +2,111 @@ package tui
 
 import (
 	"fmt"
+	"strings"
+	"unicode"
 
 	"github.com/charmbracelet/lipgloss"
 )
+
+type fastStyleMode int
+
+const (
+	fastStyleModeFallback fastStyleMode = iota // call fallback.Render directly
+	fastStyleModeSimple                        // prefix + s + suffix
+	fastStyleModePerRune                       // wrap each rune individually; different wrap for whitespace
+)
+
+// fastStyle precomputes a style's ANSI escape codes once (via real
+// lipgloss.Style.Render calls), so rendering many small tokens with the
+// same style — the common case when coloring thousands of plan attribute
+// rows — is cheap string concatenation instead of re-running lipgloss's
+// full per-call style resolution (~25 property checks, line splitting,
+// width calculation) every time.
+//
+// Strikethrough/Underline (without their *Spaces counterpart) make
+// lipgloss wrap each *rune* individually — differently for whitespace vs
+// not — rather than the whole string once; fastStyleModePerRune
+// replicates that exactly. newFastStyle always validates its derived
+// fast path against a multi-word probe string and falls back to the
+// real style's Render when it doesn't match byte-for-byte, so this is
+// always at least as correct as calling style.Render directly.
+type fastStyle struct {
+	prefix      string
+	suffix      string
+	spacePrefix string
+	spaceSuffix string
+	fallback    lipgloss.Style
+	mode        fastStyleMode
+}
+
+const fastStyleProbe = "sample value with spaces"
+
+func newFastStyle(s lipgloss.Style) fastStyle {
+	fs := fastStyle{fallback: s}
+
+	const marker = "\x00"
+	rendered := s.Render(marker)
+	idx := strings.Index(rendered, marker)
+	if idx < 0 {
+		return fs
+	}
+	fs.prefix, fs.suffix = rendered[:idx], rendered[idx+len(marker):]
+
+	if fs.prefix+fastStyleProbe+fs.suffix == s.Render(fastStyleProbe) {
+		fs.mode = fastStyleModeSimple
+		return fs
+	}
+
+	// Try replicating lipgloss's per-rune whitespace-aware wrapping
+	// (used for Strikethrough/Underline): derive the whitespace variant
+	// from rendering a lone space, then validate against the full probe.
+	spaceRendered := s.Render(" ")
+	spIdx := strings.Index(spaceRendered, " ")
+	if spIdx >= 0 {
+		fs.spacePrefix, fs.spaceSuffix = spaceRendered[:spIdx], spaceRendered[spIdx+1:]
+		fs.mode = fastStyleModePerRune
+		if fs.renderPerRune(fastStyleProbe) == s.Render(fastStyleProbe) {
+			return fs
+		}
+	}
+
+	fs.mode = fastStyleModeFallback
+	return fs
+}
+
+func (f fastStyle) Render(s string) string {
+	switch f.mode {
+	case fastStyleModeSimple:
+		if f.prefix == "" && f.suffix == "" {
+			return s
+		}
+		return f.prefix + s + f.suffix
+	case fastStyleModePerRune:
+		return f.renderPerRune(s)
+	default:
+		return f.fallback.Render(s)
+	}
+}
+
+// renderPerRune replicates lipgloss's whitespace-aware per-rune wrapping
+// (see style.go's useSpaceStyler): every rune gets its own prefix/suffix,
+// using the whitespace variant for whitespace runes.
+func (f fastStyle) renderPerRune(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) * 3)
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			b.WriteString(f.spacePrefix)
+			b.WriteRune(r)
+			b.WriteString(f.spaceSuffix)
+			continue
+		}
+		b.WriteString(f.prefix)
+		b.WriteRune(r)
+		b.WriteString(f.suffix)
+	}
+	return b.String()
+}
 
 // Color palette - bound to terminal ANSI slots so the app follows the user's shell theme.
 var (
@@ -97,6 +199,20 @@ var (
 	collapsedIndicator string
 )
 
+// Fast (precomputed-ANSI) equivalents of the styles above, for the hot
+// per-attribute-row rendering path (internal/tui/colorize.go, model.go's
+// renderAttributeTree and helpers, print.go). See fastStyle.
+var (
+	fastAttrName     fastStyle
+	fastAttrOldValue fastStyle
+	fastAttrNewValue fastStyle
+	fastAttrComputed fastStyle
+	fastMuted        fastStyle
+	fastSensitive    fastStyle
+	fastCreate       fastStyle
+	fastDestroy      fastStyle
+)
+
 func initStyles() {
 	// App container
 	appStyle = lipgloss.NewStyle().
@@ -164,6 +280,16 @@ func initStyles() {
 	// Expand/collapse indicators
 	expandedIndicator = lipgloss.NewStyle().Foreground(mutedColorVal).Render("▼")
 	collapsedIndicator = lipgloss.NewStyle().Foreground(mutedColorVal).Render("▶")
+
+	// Fast equivalents for the hot per-attribute-row rendering path.
+	fastAttrName = newFastStyle(attrNameStyle)
+	fastAttrOldValue = newFastStyle(attrOldValueStyle)
+	fastAttrNewValue = newFastStyle(attrNewValueStyle)
+	fastAttrComputed = newFastStyle(attrComputedStyle)
+	fastMuted = newFastStyle(mutedColor)
+	fastSensitive = newFastStyle(lipgloss.NewStyle().Foreground(replaceColor).Italic(true))
+	fastCreate = newFastStyle(lipgloss.NewStyle().Foreground(createColor))
+	fastDestroy = newFastStyle(lipgloss.NewStyle().Foreground(destroyColor))
 
 	// Help style
 	helpStyle = lipgloss.NewStyle().

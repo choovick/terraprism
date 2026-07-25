@@ -49,7 +49,7 @@ func printResource(r tfplan.Resource) {
 	fmt.Printf("%s %s %s\n",
 		symbol,
 		style.Render(r.Address),
-		mutedColor.Render(actionDesc),
+		fastMuted.Render(actionDesc),
 	)
 
 	printAttributeTree(r.Attributes, 1, true)
@@ -69,7 +69,7 @@ func printAttributeTree(attrs []tfplan.Attribute, depth int, keyed bool) {
 			for i+run < len(attrs) && attrs[i+run].Action == tfplan.ActionNoOp {
 				run++
 			}
-			fmt.Println(indent + mutedColor.Render(unchangedHiddenNote(run)))
+			fmt.Println(indent + fastMuted.Render(unchangedHiddenNote(run)))
 			i += run - 1
 			continue
 		}
@@ -78,13 +78,13 @@ func printAttributeTree(attrs []tfplan.Attribute, depth int, keyed bool) {
 			open, closeBracket := containerBrackets(attr.Kind)
 			var content string
 			if keyed {
-				content = attrNameStyle.Render(attr.Name) + " = " + mutedColor.Render(open)
+				content = fastAttrName.Render(attr.Name) + " = " + fastMuted.Render(open)
 			} else {
-				content = mutedColor.Render(open)
+				content = fastMuted.Render(open)
 			}
 			fmt.Println(indent + actionPrefixSymbol(attr.Action) + " " + content)
 			printAttributeTree(attr.Children, depth+1, attr.Kind == tfplan.KindMap)
-			fmt.Println(indent + mutedColor.Render(closeBracket))
+			fmt.Println(indent + fastMuted.Render(closeBracket))
 			continue
 		}
 
@@ -109,9 +109,9 @@ func printAttributeTree(attrs []tfplan.Attribute, depth int, keyed bool) {
 func printMultilineStringDiff(attr tfplan.Attribute, indent string, keyed bool) string {
 	var b strings.Builder
 	if keyed {
-		b.WriteString(indent + actionPrefixSymbol(attr.Action) + " " + attrNameStyle.Render(attr.Name) + " = " + mutedColor.Render("<<EOT") + "\n")
+		b.WriteString(indent + actionPrefixSymbol(attr.Action) + " " + fastAttrName.Render(attr.Name) + " = " + fastMuted.Render("<<EOT") + "\n")
 	} else {
-		b.WriteString(indent + actionPrefixSymbol(attr.Action) + " " + mutedColor.Render("<<EOT") + "\n")
+		b.WriteString(indent + actionPrefixSymbol(attr.Action) + " " + fastMuted.Render("<<EOT") + "\n")
 	}
 	contentIndent := indent + "  "
 
@@ -121,29 +121,29 @@ func printMultilineStringDiff(attr tfplan.Attribute, indent string, keyed bool) 
 	switch attr.Action {
 	case tfplan.ActionCreate:
 		for _, l := range strings.Split(newStr, "\n") {
-			b.WriteString(contentIndent + lipgloss.NewStyle().Foreground(createColor).Render("+ "+l) + "\n")
+			b.WriteString(contentIndent + fastCreate.Render("+ "+l) + "\n")
 		}
 	case tfplan.ActionDelete:
 		for _, l := range strings.Split(oldStr, "\n") {
-			b.WriteString(contentIndent + lipgloss.NewStyle().Foreground(destroyColor).Render("- "+l) + "\n")
+			b.WriteString(contentIndent + fastDestroy.Render("- "+l) + "\n")
 		}
 	case tfplan.ActionNoOp:
 		for _, l := range strings.Split(newStr, "\n") {
-			b.WriteString(contentIndent + mutedColor.Render("  "+l) + "\n")
+			b.WriteString(contentIndent + fastMuted.Render("  "+l) + "\n")
 		}
 	default:
 		diff := ComputeDiff(strings.Split(oldStr, "\n"), strings.Split(newStr, "\n"))
 		for _, d := range diff {
 			switch d.Op {
 			case DiffDelete:
-				b.WriteString(contentIndent + lipgloss.NewStyle().Foreground(destroyColor).Render("- "+d.Text) + "\n")
+				b.WriteString(contentIndent + fastDestroy.Render("- "+d.Text) + "\n")
 			case DiffInsert:
-				b.WriteString(contentIndent + lipgloss.NewStyle().Foreground(createColor).Render("+ "+d.Text) + "\n")
+				b.WriteString(contentIndent + fastCreate.Render("+ "+d.Text) + "\n")
 			case DiffEqual:
-				b.WriteString(contentIndent + mutedColor.Render("  "+d.Text) + "\n")
+				b.WriteString(contentIndent + fastMuted.Render("  "+d.Text) + "\n")
 			}
 		}
 	}
-	b.WriteString(indent + mutedColor.Render("EOT"))
+	b.WriteString(indent + fastMuted.Render("EOT"))
 	return b.String()
 }

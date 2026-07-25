@@ -1379,14 +1379,14 @@ func (m Model) renderFoldHeader(indent string, attr tfplan.Attribute, keyed, col
 
 	var content string
 	if keyed {
-		content = attrNameStyle.Render(attr.Name) + " = " + mutedColor.Render(opener)
+		content = fastAttrName.Render(attr.Name) + " = " + fastMuted.Render(opener)
 	} else {
-		content = mutedColor.Render(opener)
+		content = fastMuted.Render(opener)
 	}
 
 	result := indent + indicator + " " + actionPrefixSymbol(attr.Action) + " " + content
 	if collapsed {
-		result += mutedColor.Render(" ... " + collapsedSummary)
+		result += fastMuted.Render(" ... " + collapsedSummary)
 	}
 
 	if !selected {
@@ -1417,7 +1417,7 @@ func containerFoldSummary(attr tfplan.Attribute) string {
 
 func closingBraceLine(indent string, kind tfplan.ValueKind) string {
 	_, closeBracket := containerBrackets(kind)
-	return indent + mutedColor.Render(closeBracket)
+	return indent + fastMuted.Render(closeBracket)
 }
 
 // multilineFoldSummary formats the "N lines" text shown after a
@@ -1451,27 +1451,27 @@ func renderDiffLines(b *strings.Builder, diff []DiffLine, indent string, maxWidt
 		switch d.Op {
 		case DiffSeparator:
 			b.WriteString(indent)
-			b.WriteString(mutedColor.Render("@@ ··· @@"))
+			b.WriteString(fastMuted.Render("@@ ··· @@"))
 			b.WriteString("\n")
 		case DiffDelete:
 			wrapped := wrapText(d.Text, maxWidth-len(indent)-4)
 			for _, wl := range strings.Split(wrapped, "\n") {
 				b.WriteString(indent)
-				b.WriteString(lipgloss.NewStyle().Foreground(destroyColor).Render("- " + wl))
+				b.WriteString(fastDestroy.Render("- " + wl))
 				b.WriteString("\n")
 			}
 		case DiffInsert:
 			wrapped := wrapText(d.Text, maxWidth-len(indent)-4)
 			for _, wl := range strings.Split(wrapped, "\n") {
 				b.WriteString(indent)
-				b.WriteString(lipgloss.NewStyle().Foreground(createColor).Render("+ " + wl))
+				b.WriteString(fastCreate.Render("+ " + wl))
 				b.WriteString("\n")
 			}
 		case DiffEqual:
 			wrapped := wrapText(d.Text, maxWidth-len(indent)-4)
 			for _, wl := range strings.Split(wrapped, "\n") {
 				b.WriteString(indent)
-				b.WriteString(mutedColor.Render("  " + wl))
+				b.WriteString(fastMuted.Render("  " + wl))
 				b.WriteString("\n")
 			}
 		}
@@ -1515,7 +1515,7 @@ func (m Model) renderMultilineStringBody(attr tfplan.Attribute, indent string, m
 
 	if attr.Sensitive {
 		b.WriteString(contentIndent)
-		b.WriteString(lipgloss.NewStyle().Foreground(replaceColor).Italic(true).Render("(sensitive value)"))
+		b.WriteString(fastSensitive.Render("(sensitive value)"))
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -1533,19 +1533,19 @@ func (m Model) renderMultilineStringBody(attr tfplan.Attribute, indent string, m
 	case tfplan.ActionCreate:
 		for _, l := range strings.Split(newStr, "\n") {
 			b.WriteString(contentIndent)
-			b.WriteString(lipgloss.NewStyle().Foreground(createColor).Render("+ " + l))
+			b.WriteString(fastCreate.Render("+ " + l))
 			b.WriteString("\n")
 		}
 	case tfplan.ActionDelete:
 		for _, l := range strings.Split(oldStr, "\n") {
 			b.WriteString(contentIndent)
-			b.WriteString(lipgloss.NewStyle().Foreground(destroyColor).Render("- " + l))
+			b.WriteString(fastDestroy.Render("- " + l))
 			b.WriteString("\n")
 		}
 	case tfplan.ActionNoOp:
 		for _, l := range strings.Split(newStr, "\n") {
 			b.WriteString(contentIndent)
-			b.WriteString(mutedColor.Render("  " + l))
+			b.WriteString(fastMuted.Render("  " + l))
 			b.WriteString("\n")
 		}
 	default: // update
@@ -1553,7 +1553,7 @@ func (m Model) renderMultilineStringBody(attr tfplan.Attribute, indent string, m
 		contextDiff := ContextDiff(diff, m.diffContextSize())
 		if contextDiff == nil {
 			b.WriteString(contentIndent)
-			b.WriteString(mutedColor.Render("  (no changes)"))
+			b.WriteString(fastMuted.Render("  (no changes)"))
 			b.WriteString("\n")
 		} else {
 			renderDiffLines(&b, contextDiff, contentIndent, maxWidth)
@@ -1588,7 +1588,7 @@ func (m Model) tryRenderUserdataAttr(attr tfplan.Attribute, indent string, maxWi
 	b.WriteString(indent + actionPrefixSymbol(attr.Action) + " " + renderKeyValue(attr, true))
 	b.WriteString("\n")
 	b.WriteString(decodedIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ decoded " + attr.Name + " ┄┄┄"))
+	b.WriteString(fastMuted.Render("┄┄┄ decoded " + attr.Name + " ┄┄┄"))
 	b.WriteString("\n")
 
 	switch {
@@ -1597,7 +1597,7 @@ func (m Model) tryRenderUserdataAttr(attr tfplan.Attribute, indent string, maxWi
 		contextDiff := ContextDiff(diff, m.diffContextSize())
 		if contextDiff == nil {
 			b.WriteString(decodedIndent)
-			b.WriteString(mutedColor.Render("  (no changes in decoded content)"))
+			b.WriteString(fastMuted.Render("  (no changes in decoded content)"))
 			b.WriteString("\n")
 		} else {
 			renderDiffLines(&b, contextDiff, decodedIndent, maxWidth)
@@ -1616,7 +1616,7 @@ func (m Model) tryRenderUserdataAttr(attr tfplan.Attribute, indent string, maxWi
 		}
 	}
 	b.WriteString(decodedIndent)
-	b.WriteString(mutedColor.Render("┄┄┄ end " + attr.Name + " ┄┄┄"))
+	b.WriteString(fastMuted.Render("┄┄┄ end " + attr.Name + " ┄┄┄"))
 	return b.String(), true
 }
 
@@ -1660,7 +1660,7 @@ func (m Model) renderLeafRow(indent string, attr tfplan.Attribute, keyed bool, m
 			b.WriteString(continuation)
 		} else {
 			b.WriteString(rowPrefix)
-			b.WriteString(attrNameStyle.Render(attr.Name))
+			b.WriteString(fastAttrName.Render(attr.Name))
 			b.WriteString(" = ")
 		}
 		b.WriteString(styled.Render(sub))
@@ -1697,7 +1697,7 @@ func (m *Model) renderAttributeTree(b *strings.Builder, address string, attrs []
 			for i+run < len(attrs) && attrs[i+run].Action == tfplan.ActionNoOp {
 				run++
 			}
-			b.WriteString(indent + mutedColor.Render(unchangedHiddenNote(run)))
+			b.WriteString(indent + fastMuted.Render(unchangedHiddenNote(run)))
 			b.WriteString("\n")
 			*lineCount++
 			i += run - 1
@@ -1760,7 +1760,7 @@ func (m *Model) renderAttributeTree(b *strings.Builder, address string, attrs []
 				body := m.renderMultilineStringBody(attr, indent, maxWidth)
 				b.WriteString(body)
 				*lineCount += strings.Count(body, "\n")
-				b.WriteString(indent + mutedColor.Render("EOT"))
+				b.WriteString(indent + fastMuted.Render("EOT"))
 				b.WriteString("\n")
 				*lineCount++
 			}
@@ -1864,11 +1864,11 @@ func (m Model) renderResourceLine(r tfplan.Resource, expanded bool, isMatch bool
 	// Action description
 	actionDesc := getActionDescription(r)
 	b.WriteString(" ")
-	b.WriteString(mutedColor.Render(actionDesc))
+	b.WriteString(fastMuted.Render(actionDesc))
 
 	// Change count for expanded content
 	if n := r.ChangedAttributeCount(); n > 0 {
-		b.WriteString(mutedColor.Render(fmt.Sprintf(" (%d changes)", n)))
+		b.WriteString(fastMuted.Render(fmt.Sprintf(" (%d changes)", n)))
 	}
 
 	return b.String()
