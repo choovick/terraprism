@@ -85,6 +85,34 @@ func TestFlattenEmptyTree(t *testing.T) {
 	}
 }
 
+// Payload is caller-owned data that foldtree only carries through, never
+// inspects — Flatten must copy it onto the corresponding Row unchanged so
+// a renderer or search predicate can type-assert it back out.
+func TestFlattenCarriesPayloadThrough(t *testing.T) {
+	type payload struct{ label string }
+
+	tree := []Node{
+		{ID: "a", Height: 1, Collapsible: true, Payload: payload{"root"},
+			Children: []Node{{ID: "a.1", Height: 1, Payload: payload{"child"}}}},
+		{ID: "b", Height: 1, Payload: nil},
+	}
+
+	rows := Flatten(tree, func(string) bool { return false })
+
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3: %+v", len(rows), rows)
+	}
+	if got, ok := rows[0].Payload.(payload); !ok || got.label != "root" {
+		t.Errorf("row 'a': Payload = %#v, want payload{\"root\"}", rows[0].Payload)
+	}
+	if got, ok := rows[1].Payload.(payload); !ok || got.label != "child" {
+		t.Errorf("row 'a.1': Payload = %#v, want payload{\"child\"}", rows[1].Payload)
+	}
+	if rows[2].Payload != nil {
+		t.Errorf("row 'b': Payload = %#v, want nil", rows[2].Payload)
+	}
+}
+
 // Flatten must not recurse per tree level, or a sufficiently deep chain
 // would blow the goroutine stack. This is the "faulty/adversarial
 // structure" this package explicitly needs to survive, since resource

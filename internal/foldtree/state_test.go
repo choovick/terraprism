@@ -60,6 +60,37 @@ func TestMoveToTopAndBottom(t *testing.T) {
 	}
 }
 
+func TestSelectIndexJumpsDirectlyAndClamps(t *testing.T) {
+	s := New(5)
+	s.SetTree(flatRows(50, 1))
+
+	s.SelectIndex(30)
+	if got, want := s.SelectedIndex(), 30; got != want {
+		t.Fatalf("SelectIndex(30): SelectedIndex = %d, want %d", got, want)
+	}
+	assertVisible(t, s)
+
+	s.SelectIndex(-5)
+	if got, want := s.SelectedIndex(), 0; got != want {
+		t.Fatalf("SelectIndex(-5): SelectedIndex = %d, want %d (clamped)", got, want)
+	}
+
+	s.SelectIndex(999)
+	if got, want := s.SelectedIndex(), 49; got != want {
+		t.Fatalf("SelectIndex(999): SelectedIndex = %d, want %d (clamped)", got, want)
+	}
+	assertVisible(t, s)
+}
+
+func TestSelectIndexOnEmptyTreeIsSafe(t *testing.T) {
+	s := New(5)
+	s.SetTree(nil)
+	s.SelectIndex(3) // must not panic
+	if _, ok := s.SelectedID(); ok {
+		t.Fatalf("expected no selection on an empty tree")
+	}
+}
+
 func TestPageDownAndPageUp(t *testing.T) {
 	s := New(10)
 	s.SetTree(flatRows(100, 1))

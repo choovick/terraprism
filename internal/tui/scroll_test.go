@@ -9,6 +9,13 @@ import (
 	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
 
+// These tests drive real key/mouse messages through Update() and assert
+// on treeView's offset/selection -- the underlying scroll-offset math
+// itself is exhaustively covered by internal/foldtree's own test suite
+// (including the exact oscillation/boundary regressions these mirror),
+// so these are wiring/integration checks confirming the tui package
+// drives that library correctly, not re-tests of the algorithm.
+
 func manyResourcesPlan(n int) *tfplan.Plan {
 	resources := make([]tfplan.Resource, n)
 	for i := range resources {
@@ -21,12 +28,29 @@ func manyResourcesPlan(n int) *tfplan.Plan {
 	return &tfplan.Plan{Resources: resources}
 }
 
+// selectedRowVisible reports whether the currently selected row is
+// within the viewport's visible range.
+func selectedRowVisible(mm Model) bool {
+	nav := mm.treeView.State()
+	idx := nav.SelectedIndex()
+	if idx < 0 {
+		return true
+	}
+	return nav.RowVisible(idx)
+}
+
+// selectedLineStart returns the currently selected row's starting line.
+func selectedLineStart(mm Model) int {
+	nav := mm.treeView.State()
+	idx := nav.SelectedIndex()
+	start, _ := nav.RowLineRange(idx)
+	return start
+}
+
 // Regression: scrolling far away with the mouse wheel while the cursor
 // sits on the first (or last) item, then pressing the boundary key that
 // can't move the cursor further (k at the top, j at the bottom), used to
-// nudge the viewport back by only one line per keypress — since that
-// branch never called ensureCursorVisible, it took as many keypresses as
-// the scroll distance to bring the cursor back into view. It should snap
+// nudge the viewport back by only one line per keypress. It should snap
 // back immediately instead, exactly like moving the cursor does.
 func TestBoundaryKeyAfterMouseScrollSnapsBackImmediately(t *testing.T) {
 	tests := []struct {
@@ -58,19 +82,20 @@ func TestBoundaryKeyAfterMouseScrollSnapsBackImmediately(t *testing.T) {
 				model, _ = mm.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tc.wheelButton})
 				mm = model.(Model)
 			}
-			scrolledOffset := mm.viewport.YOffset
-			if mm.cursorLineVisible() {
-				t.Fatalf("expected the mouse wheel to scroll the cursor's row out of view, but it's still visible at YOffset=%d", scrolledOffset)
+			scrolledOffset := mm.treeView.State().Offset()
+			if selectedRowVisible(mm) {
+				t.Fatalf("expected the mouse wheel to scroll the cursor's row out of view, but it's still visible at Offset=%d", scrolledOffset)
 			}
 
 			model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(tc.boundaryKey)})
 			mm = model.(Model)
 
-			topLine := mm.viewport.YOffset
-			bottomLine := topLine + mm.viewport.Height - 1
-			if mm.selectedLineStart < topLine || mm.selectedLineStart > bottomLine {
-				t.Fatalf("cursor should be visible after a single %q press (was scrolled to %d), got viewport=[%d,%d] selectedLineStart=%d",
-					tc.boundaryKey, scrolledOffset, topLine, bottomLine, mm.selectedLineStart)
+			topLine := mm.treeView.State().Offset()
+			bottomLine := topLine + mm.treeView.Height() - 1
+			line := selectedLineStart(mm)
+			if line < topLine || line > bottomLine {
+				t.Fatalf("cursor should be visible after a single %q press (was scrolled to %d), got viewport=[%d,%d] selectedLine=%d",
+					tc.boundaryKey, scrolledOffset, topLine, bottomLine, line)
 			}
 		})
 	}
@@ -80,9 +105,9 @@ func TestBoundaryKeyAfterMouseScrollSnapsBackImmediately(t *testing.T) {
 // already where the cursor is (no mouse drift to correct for) — this is
 // the behavior the boundary branches exist for in the first place.
 // Reaching the last item via 'j' leaves its row at the exact bottom edge
-// of the viewport (ensureCursorVisible aligns it there); one more 'j' at
-// that point is the "already at cursor" case, not a mouse-drift case, so
-// it should free-scroll by exactly one more line rather than snap.
+// of the viewport; one more 'j' at that point is the "already at cursor"
+// case, not a mouse-drift case, so it should free-scroll by exactly one
+// more line rather than snap.
 func TestBoundaryKeyFreeScrollsWhenAlreadyAtCursor(t *testing.T) {
 	plan := manyResourcesPlan(40)
 	m := NewModel(plan, "")
@@ -93,29 +118,21 @@ func TestBoundaryKeyFreeScrollsWhenAlreadyAtCursor(t *testing.T) {
 		model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 		mm = model.(Model)
 	}
-	if !mm.cursorLineVisible() {
+	if !selectedRowVisible(mm) {
 		t.Fatalf("cursor should already be visible after reaching the last item via keyboard nav")
 	}
-	before := mm.viewport.YOffset
+	before := mm.treeView.State().Offset()
 
 	model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 	mm = model.(Model)
 
-	if mm.viewport.YOffset != before+1 {
-		t.Fatalf("expected free-scroll by exactly one line past the last item, got YOffset %d -> %d", before, mm.viewport.YOffset)
+	if got := mm.treeView.State().Offset(); got != before+1 {
+		t.Fatalf("expected free-scroll by exactly one line past the last item, got Offset %d -> %d", before, got)
 	}
 }
 
 // Regression: repeatedly free-scrolling past the last item used to enter
-// an unstable two-value oscillation instead of settling. Once the
-// viewport's top line advances to exactly match the selected line,
-// cursorLineVisible reports the line as still visible (it's the top edge
-// of the visible range), so the old "free-scroll by one more line while
-// visible" branch scrolled one line past it — which made the line
-// invisible on the very next press, triggering a snap-back to the exact
-// offset it had just left, then immediately free-scrolling past it
-// again, forever. It must instead settle with the selected line pinned
-// at the top of the viewport and stop.
+// an unstable two-value oscillation instead of settling.
 func TestFreeScrollPastLastItemSettlesWithoutOscillating(t *testing.T) {
 	plan := manyResourcesPlan(40)
 	m := NewModel(plan, "")
@@ -131,10 +148,9 @@ func TestFreeScrollPastLastItemSettlesWithoutOscillating(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 		mm = model.(Model)
-		offsets = append(offsets, mm.viewport.YOffset)
-		if !mm.cursorLineVisible() {
-			t.Fatalf("press #%d: selection scrolled out of view (YOffset=%d, selectedLineStart=%d)",
-				i+1, mm.viewport.YOffset, mm.selectedLineStart)
+		offsets = append(offsets, mm.treeView.State().Offset())
+		if !selectedRowVisible(mm) {
+			t.Fatalf("press #%d: selection scrolled out of view (Offset=%d)", i+1, mm.treeView.State().Offset())
 		}
 	}
 
@@ -144,22 +160,21 @@ func TestFreeScrollPastLastItemSettlesWithoutOscillating(t *testing.T) {
 			t.Fatalf("viewport did not settle, still changing after 50+ presses: %v", offsets[len(offsets)-15:])
 		}
 	}
-	if mm.selectedLineStart != last {
-		t.Fatalf("expected the selected line to settle pinned at the top of the viewport (YOffset=%d), got selectedLineStart=%d",
-			last, mm.selectedLineStart)
+	if got := selectedLineStart(mm); got != last {
+		t.Fatalf("expected the selected line to settle pinned at the top of the viewport (Offset=%d), got selectedLine=%d", last, got)
 	}
 }
 
-// Regression: reaching the last fold block of an expanded resource that
-// is itself the last (or only) displayed resource used to keep
-// free-scrolling the viewport by one line per keypress even though the
-// selected block had stopped changing — because the "free-scroll past
-// the boundary" branch didn't distinguish "stuck at the plain resource
-// row" (where free-scroll reveals the End-of-Plan footer, a real
-// feature) from "stuck deep inside a fold hierarchy with nothing further
-// to select" (where further scrolling only drifts the view away from a
-// selection that isn't moving). Once truly stuck at the last fold block,
-// further 'j' presses must be a no-op.
+// Reaching the last row of an expanded resource that is itself the last
+// (or only) displayed resource: the selection has nowhere left to go,
+// but further 'j' presses may still free-scroll the viewport to reveal
+// the trailing "End of Plan" footer, exactly like being stuck at a plain
+// resource row — under the unified single-cursor model there's no
+// special case for "stuck deep inside a fold hierarchy" any more (that
+// distinction only existed because resource-level and fold-block-level
+// navigation used to be two separate cursors). It must still settle
+// rather than oscillate, and the selection itself must never move once
+// there's nothing left to select.
 func TestLastFoldBlockOfLastResourceStopsScrollingOnceStuck(t *testing.T) {
 	nested := mapBlock("values", tfplan.ActionUpdate,
 		leaf("replicaCount", tfplan.ActionUpdate, tfplan.KindNumber, "2", "3"))
@@ -179,35 +194,37 @@ func TestLastFoldBlockOfLastResourceStopsScrollingOnceStuck(t *testing.T) {
 	model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")}) // expand its sub-blocks
 	mm = model.(Model)
 
-	blocks := mm.currentFoldBlocks()
-	if len(blocks) == 0 {
-		t.Fatalf("expected at least one fold block")
+	totalRows := len(mm.treeView.State().Rows())
+	if totalRows <= 1 {
+		t.Fatalf("expected more than just the resource row after expanding, got %d rows", totalRows)
 	}
 
-	// Step down to the last fold block.
-	for i := 0; i < len(blocks); i++ {
+	// Step down to the last row.
+	for i := 0; i < totalRows; i++ {
 		model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 		mm = model.(Model)
 	}
-	if mm.blockCursor != len(blocks)-1 {
-		t.Fatalf("expected blockCursor at the last block (%d), got %d", len(blocks)-1, mm.blockCursor)
+	if mm.treeView.State().SelectedIndex() != totalRows-1 {
+		t.Fatalf("expected selection at the last row (%d), got %d", totalRows-1, mm.treeView.State().SelectedIndex())
 	}
-	stuckOffset := mm.viewport.YOffset
-	stuckSelectedLine := mm.selectedLineStart
+	stuckIndex := mm.treeView.State().SelectedIndex()
 
-	// Further 'j' presses must not move the viewport or the selection —
-	// there's nothing left to select.
-	for i := 0; i < 5; i++ {
+	// Further 'j' presses must never move the selection — there's
+	// nothing left to select — and the viewport's free-scroll (revealing
+	// the trailing footer) must settle rather than oscillate.
+	var offsets []int
+	for i := 0; i < 30; i++ {
 		model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 		mm = model.(Model)
-		if mm.blockCursor != len(blocks)-1 {
-			t.Fatalf("blockCursor should stay at the last block, got %d", mm.blockCursor)
+		if mm.treeView.State().SelectedIndex() != stuckIndex {
+			t.Fatalf("selection should stay at the last row, got %d", mm.treeView.State().SelectedIndex())
 		}
-		if mm.viewport.YOffset != stuckOffset {
-			t.Fatalf("viewport should stop scrolling once stuck at the last block, got YOffset %d -> %d", stuckOffset, mm.viewport.YOffset)
-		}
-		if mm.selectedLineStart != stuckSelectedLine {
-			t.Fatalf("selectedLineStart should stay put once stuck, got %d -> %d", stuckSelectedLine, mm.selectedLineStart)
+		offsets = append(offsets, mm.treeView.State().Offset())
+	}
+	last := offsets[len(offsets)-1]
+	for i := len(offsets) - 10; i < len(offsets); i++ {
+		if offsets[i] != last {
+			t.Fatalf("viewport did not settle while stuck at the last row: %v", offsets[len(offsets)-15:])
 		}
 	}
 }

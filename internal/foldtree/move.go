@@ -41,6 +41,22 @@ func (s *State) MoveToBottom() {
 	s.ensureVisible()
 }
 
+// SelectIndex moves the selection directly to row i, clamping into the
+// valid range, and ensures it's visible. A no-op if there are no rows.
+func (s *State) SelectIndex(i int) {
+	if len(s.rows) == 0 {
+		return
+	}
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(s.rows) {
+		i = len(s.rows) - 1
+	}
+	s.cursor = i
+	s.ensureVisible()
+}
+
 // PageDown moves the cursor forward by roughly one viewport height's
 // worth of lines (at least one row).
 func (s *State) PageDown() { s.pageBy(1) }

@@ -4,8 +4,10 @@
 package runner
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +37,7 @@ type PlanResult struct {
 	Plan     *tfplan.Plan
 	PlanFile string // "" unless Options.KeepPlanFile was set
 	RawJSON  []byte
+	Output   []byte // combined stdout+stderr of the `plan` invocation itself
 }
 
 // PlanError wraps a failed `plan` invocation, carrying the combined
@@ -108,7 +111,7 @@ func RunPlan(ctx context.Context, opts Options) (*PlanResult, error) {
 		return nil, fmt.Errorf("decoding plan JSON: %w", err)
 	}
 
-	result := &PlanResult{Plan: plan, RawJSON: jsonBytes, PlanFile: planFile}
+	result := &PlanResult{Plan: plan, RawJSON: jsonBytes, PlanFile: planFile, Output: output}
 	if !opts.KeepPlanFile {
 		os.Remove(planFile)
 		result.PlanFile = ""
@@ -116,14 +119,63 @@ func RunPlan(ctx context.Context, opts Options) (*PlanResult, error) {
 	return result, nil
 }
 
-// Apply runs `<cmd> apply <planFile>`, streaming stdin/stdout/stderr
-// directly so the user sees terraform/tofu's own apply progress output.
-func Apply(ctx context.Context, cmd TFCommand, planFile string) error {
-	applyCmd := exec.CommandContext(ctx, string(cmd), "apply", planFile)
-	applyCmd.Stdout = os.Stdout
-	applyCmd.Stderr = os.Stderr
-	applyCmd.Stdin = os.Stdin
-	return applyCmd.Run()
+// ApplyLine is one line of streamed `apply` output.
+type ApplyLine struct {
+	Text string
+}
+
+// ApplyStream starts `<cmd> apply -auto-approve <planFile>`, merging
+// stdout and stderr into a single ordered stream of lines the way a real
+// terminal would (one process, one pipe, genuine OS-level interleaving),
+// and returns immediately once the subprocess has started. Lines arrive
+// on the returned channel as they're produced; exactly one value (nil on
+// success) is sent on the done channel once the process exits, after
+// which both channels are closed. lines is always fully drained and
+// closed before done fires, so a caller doing `for range lines` and then
+// reading done never misses trailing output.
+//
+// -auto-approve is required: unlike Apply, ApplyStream does not connect
+// the subprocess's stdin to the terminal (the caller, e.g. a running
+// TUI, owns the terminal instead), so terraform/tofu's own interactive
+// approval prompt cannot work here — the caller is expected to have
+// already gotten the user's confirmation before calling this.
+//
+// internal/runner takes no UI-framework dependency: pumping lines/done
+// into an event loop (e.g. a Bubble Tea tea.Cmd) is the caller's job.
+func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan ApplyLine, <-chan error) {
+	lines := make(chan ApplyLine, 64)
+	done := make(chan error, 1)
+
+	applyCmd := exec.CommandContext(ctx, string(cmd), "apply", "-auto-approve", planFile)
+	pr, pw := io.Pipe()
+	applyCmd.Stdout = pw
+	applyCmd.Stderr = pw
+
+	if err := applyCmd.Start(); err != nil {
+		pw.Close()
+		close(lines)
+		done <- err
+		close(done)
+		return lines, done
+	}
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- applyCmd.Wait()
+		pw.Close()
+	}()
+
+	go func() {
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			lines <- ApplyLine{Text: scanner.Text()}
+		}
+		close(lines)
+		done <- <-waitErr
+		close(done)
+	}()
+
+	return lines, done
 }
 
 // DetectCommand returns "terraform" or "tofu" based on forceTofu and

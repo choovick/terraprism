@@ -1,0 +1,329 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/CaptShanks/terraprism/internal/foldtree"
+	"github.com/CaptShanks/terraprism/internal/tfplan"
+)
+
+func testModelForAdapter(width, height, diffContext int) Model {
+	m := Model{diffContext: diffContext}
+	m.treeView = *foldtree.NewTreeView(m)
+	newTV, _ := m.treeView.Update(tea.WindowSizeMsg{Width: width, Height: height})
+	m.treeView = newTV.(foldtree.TreeView)
+	return m
+}
+
+// payloadOf type-asserts a node's Payload back to rowInfo, failing the
+// test loudly if it's missing -- every node the adapter builds should
+// carry one.
+func payloadOf(t *testing.T, n foldtree.Node) rowInfo {
+	t.Helper()
+	info, ok := n.Payload.(rowInfo)
+	if !ok {
+		t.Fatalf("node %q has no rowInfo payload (got %#v)", n.ID, n.Payload)
+	}
+	return info
+}
+
+// TestLeafNodeHeightMatchesRenderedText is the core height-fidelity
+// check: a node's declared Height must always equal exactly what its
+// cached text will render as, since foldtree's scroll/paging math is
+// driven entirely by declared Height, not by re-measuring text later.
+func TestLeafNodeHeightMatchesRenderedText(t *testing.T) {
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			leaf("simple", tfplan.ActionUpdate, tfplan.KindString, "old", "new"),
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+	node := m.buildResourceNode(r)
+
+	if len(node.Children) != 1 {
+		t.Fatalf("got %d children, want 1", len(node.Children))
+	}
+	child := node.Children[0]
+	info := payloadOf(t, child)
+	if info.kind != rowLeaf {
+		t.Fatalf("kind = %v, want rowLeaf", info.kind)
+	}
+	wantHeight := strings.Count(info.text, "\n") + 1
+	if child.Height != wantHeight {
+		t.Fatalf("Height = %d, want %d (derived from cached text)", child.Height, wantHeight)
+	}
+}
+
+// A leaf value long enough to word-wrap against a narrow viewport must
+// report a Height greater than 1, matching the actual wrapped text --
+// this is the width-dependent case the design review flagged as easy to
+// miss (not just multiline-string attributes wrap).
+func TestWrappedLeafHeightAccountsForWrapping(t *testing.T) {
+	longValue := strings.Repeat("word ", 40)
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			leaf("long", tfplan.ActionCreate, tfplan.KindString, nil, longValue),
+		}, ""),
+	}
+	m := testModelForAdapter(40, 40, defaultDiffContext) // narrow, forces wrapping
+	node := m.buildResourceNode(r)
+
+	child := node.Children[0]
+	info := payloadOf(t, child)
+	wantHeight := strings.Count(info.text, "\n") + 1
+	if wantHeight <= 1 {
+		t.Fatalf("setup: expected the long value to actually wrap in a 40-wide viewport, got height %d", wantHeight)
+	}
+	if child.Height != wantHeight {
+		t.Fatalf("Height = %d, want %d", child.Height, wantHeight)
+	}
+}
+
+// TestContainerGetsSyntheticClosingChild verifies the container-node
+// shape: Height 1 for the header (so a collapsed container is charged
+// exactly one line, matching its one-line summary), plus a synthetic
+// trailing child for the closing bracket that only appears when
+// expanded.
+func TestContainerGetsSyntheticClosingChild(t *testing.T) {
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			mapBlock("tags", tfplan.ActionUpdate,
+				leaf("Name", tfplan.ActionUpdate, tfplan.KindString, "a", "b"),
+			),
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+	node := m.buildResourceNode(r)
+
+	container := node.Children[0]
+	if container.Height != 1 {
+		t.Fatalf("container header Height = %d, want 1", container.Height)
+	}
+	if !container.Collapsible {
+		t.Fatalf("container should be collapsible")
+	}
+	if got, want := len(container.Children), 2; got != want { // Name leaf + synthetic close
+		t.Fatalf("got %d container children, want %d: %+v", got, want, container.Children)
+	}
+	closeChild := container.Children[len(container.Children)-1]
+	closeInfo := payloadOf(t, closeChild)
+	if closeInfo.kind != rowClosingBracket {
+		t.Fatalf("last child should be the synthetic closing bracket, got kind %v", closeInfo.kind)
+	}
+	if closeChild.Height != 1 || closeChild.Collapsible {
+		t.Fatalf("closing bracket node = %+v, want Height:1 Collapsible:false", closeChild)
+	}
+
+	// Collapsing the container must hide both the real child and the
+	// synthetic closing bracket -- verified against a real State, since
+	// that's the actual mechanism that will run in the app.
+	s := foldtree.New(20)
+	s.SetTree([]foldtree.Node{node})
+	if got, want := len(s.Rows()), 4; got != want { // resource, container, Name, close
+		t.Fatalf("expanded: got %d rows, want %d", got, want)
+	}
+	s.SetCollapsed(container.ID, true)
+	if got, want := len(s.Rows()), 2; got != want { // resource, container (summary only)
+		t.Fatalf("collapsed: got %d rows, want %d", got, want)
+	}
+}
+
+// TestMultilineStringGetsBodyAndEOTChildren mirrors the container case
+// for multiline strings: header Height 1, synthetic body + EOT children
+// that disappear when collapsed.
+func TestMultilineStringGetsBodyAndEOTChildren(t *testing.T) {
+	old := strings.Repeat("line\n", 10)
+	new := strings.Repeat("line\n", 9) + "changed\n"
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			leaf("script", tfplan.ActionUpdate, tfplan.KindString, strings.TrimRight(old, "\n"), strings.TrimRight(new, "\n")),
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+	node := m.buildResourceNode(r)
+
+	header := node.Children[0]
+	info := payloadOf(t, header)
+	if info.kind != rowMultilineHeader {
+		t.Fatalf("kind = %v, want rowMultilineHeader", info.kind)
+	}
+	if header.Height != 1 {
+		t.Fatalf("multiline header Height = %d, want 1", header.Height)
+	}
+	if got, want := len(header.Children), 2; got != want { // body + EOT
+		t.Fatalf("got %d children, want %d", got, want)
+	}
+
+	bodyInfo := payloadOf(t, header.Children[0])
+	if bodyInfo.kind != rowMultilineBody {
+		t.Fatalf("first child should be the multiline body")
+	}
+	wantBodyHeight := strings.Count(bodyInfo.text, "\n")
+	if header.Children[0].Height != wantBodyHeight {
+		t.Fatalf("body Height = %d, want %d (derived from cached text)", header.Children[0].Height, wantBodyHeight)
+	}
+
+	eotInfo := payloadOf(t, header.Children[1])
+	if eotInfo.kind != rowEOT || header.Children[1].Height != 1 {
+		t.Fatalf("second child should be a 1-line EOT row, got %+v info=%+v", header.Children[1], eotInfo)
+	}
+
+	s := foldtree.New(20)
+	s.SetTree([]foldtree.Node{node})
+	expandedRows := len(s.Rows())
+	s.SetCollapsed(header.ID, true)
+	if got, want := len(s.Rows()), expandedRows-2; got != want {
+		t.Fatalf("collapsing should hide exactly the body+EOT rows: got %d rows, want %d", got, want)
+	}
+}
+
+// A run of consecutive unchanged (ActionNoOp) attributes must collapse
+// into exactly one synthetic node, not one per hidden attribute --
+// preserves the existing noise-hiding feature under the new "every
+// attribute is a node" model.
+func TestNoopRunBecomesOneSyntheticNode(t *testing.T) {
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			leaf("a", tfplan.ActionNoOp, tfplan.KindString, "x", "x"),
+			leaf("b", tfplan.ActionNoOp, tfplan.KindString, "y", "y"),
+			leaf("c", tfplan.ActionNoOp, tfplan.KindString, "z", "z"),
+			leaf("changed", tfplan.ActionUpdate, tfplan.KindString, "1", "2"),
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+	node := m.buildResourceNode(r)
+
+	if got, want := len(node.Children), 2; got != want { // one noop-note + the changed leaf
+		t.Fatalf("got %d children, want %d: %+v", got, want, node.Children)
+	}
+	noteInfo := payloadOf(t, node.Children[0])
+	if noteInfo.kind != rowUnchangedNote {
+		t.Fatalf("first child kind = %v, want rowUnchangedNote", noteInfo.kind)
+	}
+	if !strings.Contains(stripRenderANSI(noteInfo.text), "3 unchanged attributes hidden") {
+		t.Fatalf("unexpected note text: %q", noteInfo.text)
+	}
+	if node.Children[0].Height != 1 {
+		t.Fatalf("noop-note Height = %d, want 1", node.Children[0].Height)
+	}
+}
+
+// An empty container (a map/list with zero children) isn't a
+// foldable block -- isContainerAttr excludes it -- so it must fall
+// through to the plain leaf path just like any scalar.
+func TestEmptyContainerRendersAsLeaf(t *testing.T) {
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			{Name: "empty_map", Kind: tfplan.KindMap, Action: tfplan.ActionNoOp},
+		}, ""),
+	}
+	// Force the "changed" path so it's not swallowed by noop-run
+	// collapsing, to inspect it directly.
+	r.Attributes[0].Action = tfplan.ActionCreate
+
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+	node := m.buildResourceNode(r)
+
+	if len(node.Children) != 1 {
+		t.Fatalf("got %d children, want 1", len(node.Children))
+	}
+	info := payloadOf(t, node.Children[0])
+	if info.kind != rowLeaf {
+		t.Fatalf("empty container kind = %v, want rowLeaf", info.kind)
+	}
+	if len(node.Children[0].Children) != 0 {
+		t.Fatalf("empty container node should have no foldtree children")
+	}
+}
+
+// Sensitive attributes are their own plain, single-line, non-foldable
+// node.
+func TestSensitiveAttrIsOwnNode(t *testing.T) {
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			{Name: "password", Kind: tfplan.KindString, Action: tfplan.ActionUpdate, Sensitive: true},
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+	node := m.buildResourceNode(r)
+
+	if len(node.Children) != 1 {
+		t.Fatalf("got %d children, want 1", len(node.Children))
+	}
+	child := node.Children[0]
+	info := payloadOf(t, child)
+	if info.kind != rowSensitive {
+		t.Fatalf("kind = %v, want rowSensitive", info.kind)
+	}
+	if child.Height != 1 || child.Collapsible {
+		t.Fatalf("sensitive node = %+v, want Height:1 Collapsible:false", child)
+	}
+}
+
+// Synthetic IDs must be deterministic across rebuilds of the identical
+// data, since foldtree's cursor-preservation-by-ID depends on it -- if
+// the cursor happens to sit on a closing bracket / EOT / noop-note row
+// when a rebuild happens (routine, since resize and diffContext changes
+// force rebuilds), selection must survive.
+func TestSyntheticIDsAreDeterministicAcrossRebuilds(t *testing.T) {
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			mapBlock("tags", tfplan.ActionUpdate, leaf("Name", tfplan.ActionUpdate, tfplan.KindString, "a", "b")),
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+
+	node1 := m.buildResourceNode(r)
+	node2 := m.buildResourceNode(r)
+
+	close1 := node1.Children[0].Children[len(node1.Children[0].Children)-1].ID
+	close2 := node2.Children[0].Children[len(node2.Children[0].Children)-1].ID
+	if close1 != close2 {
+		t.Fatalf("closing-bracket ID not deterministic: %q vs %q", close1, close2)
+	}
+
+	s := foldtree.New(20)
+	s.SetTree([]foldtree.Node{node1})
+	s.SelectIndex(len(s.Rows()) - 1) // land on the closing bracket
+	selectedBefore, _ := s.SelectedID()
+	if selectedBefore != close1 {
+		t.Fatalf("setup: expected to land on the closing bracket, got %q", selectedBefore)
+	}
+
+	s.SetTree([]foldtree.Node{node2}) // simulate a rebuild (e.g. resize/diffContext change)
+	selectedAfter, _ := s.SelectedID()
+	if selectedAfter != close1 {
+		t.Fatalf("selection did not survive a rebuild while sitting on a synthetic row: got %q, want %q", selectedAfter, close1)
+	}
+}
+
+// Payload must round-trip through State itself, not just survive the
+// adapter's own construction -- Flatten copies Node.Payload onto Row,
+// and the app's render loop reads it back from there.
+func TestPayloadSurvivesStateRoundTrip(t *testing.T) {
+	r := tfplan.Resource{Address: "null_resource.a"}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+	node := m.buildResourceNode(r)
+
+	s := foldtree.New(20)
+	s.SetTree([]foldtree.Node{node})
+	rows := s.Rows()
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	info, ok := rows[0].Payload.(rowInfo)
+	if !ok || info.kind != rowResource || info.resource.Address != "null_resource.a" {
+		t.Fatalf("Row.Payload after SetTree/Rows = %#v, want the resource's rowInfo", rows[0].Payload)
+	}
+}

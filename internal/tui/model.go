@@ -1,59 +1,52 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wordwrap"
 
+	"github.com/CaptShanks/terraprism/internal/foldtree"
+	"github.com/CaptShanks/terraprism/internal/runner"
 	"github.com/CaptShanks/terraprism/internal/tfplan"
 	"github.com/CaptShanks/terraprism/internal/updater"
 )
 
 // Model represents the TUI state
 type Model struct {
-	plan               *tfplan.Plan
-	cursor             int
-	expanded           map[int]bool
-	foldedBlocks       map[string]bool
-	blockCursor        int
-	diffContext        int
-	viewport           viewport.Model
-	ready              bool
-	width              int
-	height             int
-	searching          bool
-	searchInput        textinput.Model
-	searchQuery        string
-	searchMatches      []int
-	currentMatch       int
-	pendingG           bool  // Track if 'g' was pressed, waiting for second 'g'
-	resourceLineStarts []int // rendered line offset per resource (populated during render)
-	selectedLineStart  int   // rendered line offset for the current resource or sub-block cursor
-	contentLineCount   int   // total rendered content lines (excluding padding)
+	plan            *tfplan.Plan
+	treeView        foldtree.TreeView // owns nav, viewport, and search
+	outputPane      foldtree.LogPane  // hideable pane showing captured/streamed terraform output; outputPane.Visible() is the single source of truth for whether it's shown
+	planOutput      string            // captured `plan` output, shown in the output pane via 'o'
+	defaultsApplied map[string]bool   // node IDs that have already had a default collapse state applied
+	diffContext     int
+	ready           bool
+	width           int
+	height          int
 
 	// Apply mode fields
-	applyMode    bool   // Whether apply is available
-	planFile     string // Path to the plan file
-	tfCommand    string // "terraform" or "tofu"
-	shouldApply  bool   // User pressed 'a' to apply
-	confirmApply bool   // Waiting for confirmation
+	applyMode      bool   // Whether apply is available
+	planFile       string // Path to the plan file
+	tfCommand      string // "terraform" or "tofu"
+	confirmApply   bool   // Waiting for confirmation
+	applying       bool   // apply subprocess is currently running
+	applyAttempted bool   // an apply was started at some point, regardless of outcome
+	applyResult    error  // nil until applyAttempted && !applying; nil then means success
+	applyLines     <-chan runner.ApplyLine
+	applyDone      <-chan error
 
 	// Status filter fields
-	statusFilters map[tfplan.Action]bool // true = show resources with this action
-	filtering     bool                   // filter picker is open
-	filterCursor  int                    // cursor in filter picker
+	filterPicker foldtree.Picker[tfplan.Action]
+	filtering    bool // filter picker is open
 
 	// Sort fields
-	sortOrder  SortOrder // default, byAction, byAddress, byType
-	sorting    bool      // sort picker is open
-	sortCursor int       // cursor in sort picker
+	sortPicker foldtree.Picker[SortOrder]
+	sorting    bool // sort picker is open
 
 	// Update nudge
 	currentVersion  string // for update check
@@ -102,9 +95,9 @@ var filterableActions = []tfplan.Action{
 }
 
 // filteredResources returns indices into plan.Resources that pass the status filter.
-// When statusFilters is empty or nil, returns all indices.
+// When no filter is active, returns all indices.
 func (m *Model) filteredResources() []int {
-	if len(m.statusFilters) == 0 {
+	if len(m.filterPicker.Selected) == 0 {
 		indices := make([]int, len(m.plan.Resources))
 		for i := range m.plan.Resources {
 			indices[i] = i
@@ -113,7 +106,7 @@ func (m *Model) filteredResources() []int {
 	}
 	var indices []int
 	for i, r := range m.plan.Resources {
-		if m.statusFilters[r.Action] {
+		if m.filterPicker.Selected[r.Action] {
 			indices = append(indices, i)
 		}
 	}
@@ -123,13 +116,14 @@ func (m *Model) filteredResources() []int {
 // sortedResources returns filtered indices sorted by the current sort order.
 func (m *Model) sortedResources() []int {
 	filtered := m.filteredResources()
-	if m.sortOrder == SortDefault || m.sortOrder == "" {
+	order := m.sortPicker.Current()
+	if order == SortDefault || order == "" {
 		return filtered
 	}
 	sort.Slice(filtered, func(i, j int) bool {
 		ri := m.plan.Resources[filtered[i]]
 		rj := m.plan.Resources[filtered[j]]
-		switch m.sortOrder {
+		switch order {
 		case SortByAction:
 			oi, oki := actionOrder[ri.Action]
 			oj, okj := actionOrder[rj.Action]
@@ -156,71 +150,64 @@ func (m *Model) sortedResources() []int {
 	return filtered
 }
 
-// displayedResourceIndices returns the resource indices to display.
-// When searchQuery is empty: returns sortedResources() (all filtered/sorted).
-// When searchQuery is non-empty: returns only matching resources (filtered by search).
-func (m *Model) displayedResourceIndices() []int {
-	sorted := m.sortedResources()
-	if m.searchQuery == "" {
-		return sorted
+// newFilterPicker builds the multi-select "filter by status" picker,
+// with each option's label colored the same way its resource rows are.
+func newFilterPicker() foldtree.Picker[tfplan.Action] {
+	p := foldtree.NewPicker(filterableActions, func(a tfplan.Action) string {
+		return GetResourceStyle(string(a)).Render(filterActionLabel(a))
+	})
+	p.Multi = true
+	return *p
+}
+
+// newSortPicker builds the single-select "sort by" picker.
+func newSortPicker() foldtree.Picker[SortOrder] {
+	p := foldtree.NewPicker(sortOptions, sortOrderLabel)
+	p.Hint = sortOrderHint
+	p.SetCurrent(SortDefault)
+	return *p
+}
+
+// outputPaneHeight is how many lines the output pane occupies once shown.
+const outputPaneHeight = 12
+
+// newModel builds the shared TreeView+LogPane plumbing for both NewModel
+// and NewModelWithApply.
+func newModel(plan *tfplan.Plan, version string, planOutput string) Model {
+	m := Model{
+		plan:            withDisplayResources(plan),
+		defaultsApplied: make(map[string]bool),
+		diffContext:     defaultDiffContext,
+		filterPicker:    newFilterPicker(),
+		sortPicker:      newSortPicker(),
+		currentVersion:  version,
+		planOutput:      planOutput,
 	}
-	if len(m.searchMatches) == 0 {
-		return []int{} // no matches, show empty
+	m.treeView = *foldtree.NewTreeView(m)
+	m.outputPane = *foldtree.NewLogPane()
+	if planOutput != "" {
+		m.outputPane.SetLines(strings.Split(planOutput, "\n"))
 	}
-	// searchMatches holds display indices into sorted; map to resource indices
-	result := make([]int, 0, len(m.searchMatches))
-	for _, displayIdx := range m.searchMatches {
-		if displayIdx >= 0 && displayIdx < len(sorted) {
-			result = append(result, sorted[displayIdx])
-		}
-	}
-	return result
+	return m
 }
 
 // NewModel creates a new TUI model (view-only mode)
 func NewModel(plan *tfplan.Plan, version string) Model {
-	ti := textinput.New()
-	ti.Placeholder = "Search..."
-	ti.CharLimit = 100
-	ti.Width = 40
-
-	return Model{
-		plan:           withDisplayResources(plan),
-		expanded:       make(map[int]bool),
-		foldedBlocks:   make(map[string]bool),
-		blockCursor:    -1,
-		diffContext:    defaultDiffContext,
-		searchInput:    ti,
-		searchMatches:  []int{},
-		applyMode:      false,
-		statusFilters:  nil, // nil = show all
-		sortOrder:      SortDefault,
-		currentVersion: version,
-	}
+	m := newModel(plan, version, "")
+	m.applyMode = false
+	return m
 }
 
-// NewModelWithApply creates a TUI model with apply capability
-func NewModelWithApply(plan *tfplan.Plan, planFile, tfCommand, version string) Model {
-	ti := textinput.New()
-	ti.Placeholder = "Search..."
-	ti.CharLimit = 100
-	ti.Width = 40
-
-	return Model{
-		plan:           withDisplayResources(plan),
-		expanded:       make(map[int]bool),
-		foldedBlocks:   make(map[string]bool),
-		blockCursor:    -1,
-		diffContext:    defaultDiffContext,
-		searchInput:    ti,
-		searchMatches:  []int{},
-		applyMode:      true,
-		planFile:       planFile,
-		tfCommand:      tfCommand,
-		statusFilters:  nil, // nil = show all
-		sortOrder:      SortDefault,
-		currentVersion: version,
-	}
+// NewModelWithApply creates a TUI model with apply capability.
+// planOutput is the already-captured `plan` invocation's own output
+// (runner.PlanResult.Output), shown in the output pane via 'o' before
+// any apply has run.
+func NewModelWithApply(plan *tfplan.Plan, planFile, tfCommand, version, planOutput string) Model {
+	m := newModel(plan, version, planOutput)
+	m.applyMode = true
+	m.planFile = planFile
+	m.tfCommand = tfCommand
+	return m
 }
 
 // withDisplayResources returns a Plan whose Resources includes output
@@ -238,9 +225,18 @@ func withDisplayResources(plan *tfplan.Plan) *tfplan.Plan {
 	return &display
 }
 
-// ShouldApply returns true if user chose to apply
-func (m Model) ShouldApply() bool {
-	return m.shouldApply
+// ApplyAttempted reports whether an apply was ever started, regardless
+// of outcome -- meaningful only after the TUI program has exited (quit
+// is blocked while an apply is still in flight, so by then it's settled).
+func (m Model) ApplyAttempted() bool {
+	return m.applyAttempted
+}
+
+// ApplyResult reports the outcome of the apply started during this
+// session: nil if it succeeded (or hasn't been attempted -- check
+// ApplyAttempted first), non-nil on failure.
+func (m Model) ApplyResult() error {
+	return m.applyResult
 }
 
 // Init initializes the model
@@ -262,41 +258,67 @@ func checkUpdateCmd(version string) tea.Cmd {
 	}
 }
 
+// chromeHeight returns the header/footer line budget outside the tree
+// view's own content area, given the current update-nudge state.
+func (m Model) chromeHeight() (header, footer int) {
+	header = 4 // Title + summary + blank line
+	footer = 3 // Help text
+	if m.updateAvailable != "" {
+		footer = 4 // +1 for update nudge line
+	}
+	return header, footer
+}
+
+// reflow (re)computes the height split between treeView and the output
+// pane from the last known terminal size, and pushes a resize into both
+// -- needed on every actual terminal resize, but also whenever the
+// output pane's visibility is toggled, since that changes the split
+// without a new tea.WindowSizeMsg arriving. The output pane is resized
+// even while hidden, so it's immediately ready the instant it's shown.
+func (m *Model) reflow() {
+	if !m.ready {
+		return
+	}
+	header, footer := m.chromeHeight()
+	contentWidth := m.width - 4
+	contentHeight := m.height - header - footer
+
+	treeHeight := contentHeight
+	if m.outputPane.Visible() {
+		treeHeight = contentHeight - outputPaneHeight
+	}
+	if treeHeight < 1 {
+		treeHeight = 1
+	}
+	auxHeight := contentHeight - treeHeight
+	if auxHeight < 0 {
+		auxHeight = 0
+	}
+
+	newTV, _ := m.treeView.Update(tea.WindowSizeMsg{Width: contentWidth, Height: treeHeight})
+	m.treeView = newTV.(foldtree.TreeView)
+	newPane, _ := m.outputPane.Update(tea.WindowSizeMsg{Width: contentWidth, Height: auxHeight})
+	m.outputPane = newPane.(foldtree.LogPane)
+}
+
 // Update handles messages
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-	var cmds []tea.Cmd
-
 	switch msg := msg.(type) {
 	case UpdateAvailableMsg:
 		m.updateAvailable = msg.Version
-		// Resize viewport to account for the extra footer line
-		if m.ready && m.height > 0 {
-			headerHeight := 4
-			footerHeight := 4 // help + nudge
-			m.viewport.Height = m.height - headerHeight - footerHeight
-		}
+		m.reflow()
 		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-
-		headerHeight := 4 // Title + summary + blank line
-		footerHeight := 3 // Help text
-		if m.updateAvailable != "" {
-			footerHeight = 4 // +1 for update nudge line
-		}
-
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width-4, msg.Height-headerHeight-footerHeight)
-			m.viewport.YPosition = headerHeight
-			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width - 4
-			m.viewport.Height = msg.Height - headerHeight - footerHeight
-		}
-		m.updateViewportContent()
+		m.ready = true
+		m.reflow()
+		// Width and height both affect the tree: width drives leaf/diff
+		// wrapping (so declared node heights change), height drives the
+		// viewport's own scroll math -- both need a full rebuild.
+		m.rebuildTree()
+		return m, nil
 
 	case tea.KeyMsg:
 		if m.filtering {
@@ -305,43 +327,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.sorting {
 			return m.handleSortKey(msg)
 		}
-		if m.searching {
-			switch msg.String() {
-			case "enter":
-				m.searching = false
-				m.searchQuery = m.searchInput.Value()
-				m.performSearch()
-				m.clampCursorAndRefreshSearch()
-				m.updateViewportContent()
-			case "esc":
-				m.searching = false
-				m.searchInput.SetValue("")
-				m.searchQuery = ""
-				m.searchMatches = []int{}
-				m.clampCursorAndRefreshSearch()
-				m.updateViewportContent()
-			case "up":
-				return m.handleSearchArrowUp(), nil
-			case "down":
-				return m.handleSearchArrowDown(), nil
-			default:
-				m.searchInput, cmd = m.searchInput.Update(msg)
-				m.searchQuery = m.searchInput.Value()
-				m.performSearch()
-				m.clampCursorAndRefreshSearch()
-				m.updateViewportContent()
-				cmds = append(cmds, cmd)
-			}
-		} else {
-			return m.handleNormalKey(msg)
+		if m.treeView.SearchActive() {
+			newTV, cmd := m.treeView.Update(msg)
+			m.treeView = newTV.(foldtree.TreeView)
+			return m, cmd
 		}
+		return m.handleNormalKey(msg)
 
 	case tea.MouseMsg:
-		m.viewport, cmd = m.viewport.Update(msg)
-		cmds = append(cmds, cmd)
+		newTV, cmd := m.treeView.Update(msg)
+		m.treeView = newTV.(foldtree.TreeView)
+		return m, cmd
+
+	case applyStreamStartedMsg:
+		m.applyAttempted = true
+		m.applyLines = msg.lines
+		m.applyDone = msg.done
+		m.outputPane.Reset()
+		m.outputPane.SetVisible(true)
+		m.reflow()
+		return m, waitForApplyEvent(msg.lines, msg.done)
+
+	case applyLineMsg:
+		m.outputPane.Append(msg.Text)
+		return m, waitForApplyEvent(m.applyLines, m.applyDone)
+
+	case applyDoneMsg:
+		m.applying = false
+		m.applyResult = msg.err
+		return m, nil
 	}
 
-	return m, tea.Batch(cmds...)
+	return m, nil
 }
 
 const (
@@ -367,927 +384,322 @@ func clampDiffContext(context int) int {
 // normalKeyHandler handles a single key in normal mode. Returns (model, cmd, quit).
 type normalKeyHandler func(m Model) (Model, tea.Cmd, bool)
 
-var normalKeyHandlers = map[string]normalKeyHandler{
-	"q":         func(m Model) (Model, tea.Cmd, bool) { return m, tea.Quit, true },
-	"ctrl+c":    func(m Model) (Model, tea.Cmd, bool) { return m, tea.Quit, true },
-	"up":        handleKeyUp,
-	"k":         handleKeyUp,
-	"down":      handleKeyDown,
-	"j":         handleKeyDown,
-	"enter":     handleKeyEnter,
-	" ":         handleKeyEnter,
-	"e":         handleKeyExpandAll,
-	"E":         handleKeyExpandEverything,
-	"c":         handleKeyCollapseAll,
-	"C":         handleKeyCollapseEverything,
-	"f":         handleKeyFilter,
-	"s":         handleKeySort,
-	"/":         handleKeySearch,
-	"n":         handleKeyNextMatch,
-	"N":         handleKeyPrevMatch,
-	"esc":       handleKeyEsc,
-	"backspace": handleKeyCollapseCurrent,
-	"h":         handleKeyCollapseCurrent,
-	"left":      handleKeyCollapseCurrent,
-	"d":         handleKeyHalfPageDown,
-	"ctrl+d":    handleKeyHalfPageDown,
-	"u":         handleKeyHalfPageUp,
-	"ctrl+u":    handleKeyHalfPageUp,
-	"ctrl+e":    handleKeyScrollLineDown,
-	"ctrl+y":    handleKeyScrollLineUp,
-	"+":         handleKeyIncreaseDiffContext,
-	"=":         handleKeyIncreaseDiffContext,
-	"-":         handleKeyDecreaseDiffContext,
-	"g":         handleKeyG,
-	"G":         handleKeyGG,
-	"pgup":      handleKeyPgUp,
-	"pgdown":    handleKeyPgDown,
-	"l":         handleKeyExpandCurrent,
-	"right":     handleKeyExpandCurrent,
-	"a":         handleKeyApply,
-	"y":         handleKeyConfirmApply,
+// tuiKeyHandlers covers only terraprism-specific keys (quitting, opening
+// pickers, diff context, apply) -- anything not listed here is forwarded
+// to treeView.Update, which owns all generic navigation/expand-collapse/
+// search key handling.
+var tuiKeyHandlers = map[string]normalKeyHandler{
+	"q":      handleKeyQuit,
+	"ctrl+c": handleKeyQuit,
+	"f":      handleKeyFilter,
+	"s":      handleKeySort,
+	"o":      handleKeyToggleOutput,
+	"esc":    handleKeyEsc,
+	"+":      handleKeyIncreaseDiffContext,
+	"=":      handleKeyIncreaseDiffContext,
+	"-":      handleKeyDecreaseDiffContext,
+	"a":      handleKeyApply,
+	"y":      handleKeyConfirmApply,
 }
 
-func handleKeyUp(m Model) (Model, tea.Cmd, bool) {
-	if m.blockCursor >= 0 {
-		m.blockCursor--
-		m.updateViewportContent()
-		m.ensureCursorVisible()
+// handleKeyQuit quits, unless an apply is currently running -- letting
+// the program exit mid-apply would race main.go's plan-file cleanup
+// against the still-running subprocess and orphan it, since nothing
+// left running after the TUI exits could still cancel it.
+func handleKeyQuit(m Model) (Model, tea.Cmd, bool) {
+	if m.applying {
 		return m, nil, true
 	}
-
-	if m.cursor > 0 {
-		m.cursor--
-		if blocks := m.currentFoldBlocks(); m.expanded[m.currentResourceIndex()] && len(blocks) > 0 {
-			m.blockCursor = len(blocks) - 1
-		}
-		m.updateViewportContent()
-		m.ensureCursorVisible()
-	} else {
-		m.scrollPastBoundary(false)
-	}
-	return m, nil, true
+	return m, tea.Quit, true
 }
 
-// handleSearchArrowUp handles up arrow in search mode (scroll filtered list)
-func (m Model) handleSearchArrowUp() Model {
-	if m.cursor > 0 {
-		m.cursor--
-		m.blockCursor = -1
-		m.updateViewportContent()
-		m.ensureCursorVisible()
-	} else {
-		m.scrollPastBoundary(false)
-	}
-	return m
-}
-
-// handleSearchArrowDown handles down arrow in search mode (scroll filtered list)
-func (m Model) handleSearchArrowDown() Model {
-	displayed := m.displayedResourceIndices()
-	if m.cursor < len(displayed)-1 {
-		m.cursor++
-		m.blockCursor = -1
-		m.updateViewportContent()
-		m.ensureCursorVisible()
-	} else {
-		m.scrollPastBoundary(true)
-	}
-	return m
-}
-
-func handleKeyDown(m Model) (Model, tea.Cmd, bool) {
-	if blocks := m.currentFoldBlocks(); m.expanded[m.currentResourceIndex()] && m.blockCursor < len(blocks)-1 {
-		m.blockCursor++
-		m.updateViewportContent()
-		m.ensureCursorVisible()
+// handleKeyToggleOutput shows/hides the output pane. There's nothing to
+// show until a `plan` has actually produced output (NewModel's pure
+// view-only path never runs one).
+func handleKeyToggleOutput(m Model) (Model, tea.Cmd, bool) {
+	if m.planOutput == "" {
 		return m, nil, true
 	}
-
-	filtered := m.displayedResourceIndices()
-	if m.cursor < len(filtered)-1 {
-		m.cursor++
-		m.blockCursor = -1
-		m.updateViewportContent()
-		m.ensureCursorVisible()
-	} else if m.blockCursor < 0 {
-		// At the last resource's own row (not inside its fold
-		// hierarchy): free-scroll past it to reveal the "End of Plan"
-		// footer, or snap back if the mouse wheel scrolled away.
-		m.scrollPastBoundary(true)
-	} else if !m.cursorLineVisible() {
-		// Stuck at the last fold block of the last resource — nothing
-		// left to select — but the mouse wheel scrolled the view away
-		// from it; snap back rather than free-scrolling further, which
-		// would just drift the view away from a selection that isn't
-		// moving.
-		m.ensureCursorVisible()
-	}
-	return m, nil, true
-}
-
-func handleKeyEnter(m Model) (Model, tea.Cmd, bool) {
-	if m.toggleCurrentFold() {
-		m.updateViewportContent()
-		m.ensureCursorVisible()
-		return m, nil, true
-	}
-
-	filtered := m.displayedResourceIndices()
-	if len(filtered) > 0 && m.cursor >= 0 && m.cursor < len(filtered) {
-		resourceIdx := filtered[m.cursor]
-		m.expanded[resourceIdx] = !m.expanded[resourceIdx]
-		m.blockCursor = -1
-	}
-	m.updateViewportContent()
-	m.scrollForExpanded()
-	return m, nil, true
-}
-
-// handleKeyExpandAll expands the cursor's current scope recursively:
-//   - inside a sub-fold: that fold and its descendants
-//   - at root: the cursor's resource and all its sub-folds
-//
-// Use Shift+E (handleKeyExpandEverything) for a global expand across all resources.
-func handleKeyExpandAll(m Model) (Model, tea.Cmd, bool) {
-	if m.blockCursor >= 0 && m.setCurrentScopeFoldsCollapsed(false) {
-		m.updateViewportContent()
-		m.ensureCursorVisible()
-		return m, nil, true
-	}
-
-	filtered := m.displayedResourceIndices()
-	if len(filtered) > 0 && m.cursor >= 0 && m.cursor < len(filtered) {
-		m.expanded[filtered[m.cursor]] = true
-		m.setCurrentScopeFoldsCollapsed(false)
-	}
-	m.updateViewportContent()
-	m.ensureCursorVisible()
-	return m, nil, true
-}
-
-// handleKeyCollapseAll collapses the cursor's current scope recursively.
-// Use Shift+C (handleKeyCollapseEverything) for a global collapse.
-func handleKeyCollapseAll(m Model) (Model, tea.Cmd, bool) {
-	if m.blockCursor >= 0 && m.setCurrentScopeFoldsCollapsed(true) {
-		m.updateViewportContent()
-		m.ensureCursorVisible()
-		return m, nil, true
-	}
-
-	filtered := m.displayedResourceIndices()
-	if len(filtered) > 0 && m.cursor >= 0 && m.cursor < len(filtered) {
-		idx := filtered[m.cursor]
-		m.setCurrentScopeFoldsCollapsed(true)
-		m.expanded[idx] = false
-		m.blockCursor = -1
-	}
-	m.updateViewportContent()
-	m.ensureCursorVisible()
-	return m, nil, true
-}
-
-func handleKeyExpandEverything(m Model) (Model, tea.Cmd, bool) {
-	m.expandEverything()
-	return m, nil, true
-}
-
-func handleKeyCollapseEverything(m Model) (Model, tea.Cmd, bool) {
-	m.collapseEverything()
+	m.outputPane.Toggle()
+	m.reflow()
 	return m, nil, true
 }
 
 func handleKeyFilter(m Model) (Model, tea.Cmd, bool) {
 	m.filtering = true
-	m.filterCursor = 0
-	if m.statusFilters == nil {
-		m.statusFilters = make(map[tfplan.Action]bool)
-	}
+	m.filterPicker.SetCursor(0)
 	return m, nil, true
 }
 
 func handleKeySort(m Model) (Model, tea.Cmd, bool) {
 	m.sorting = true
-	m.sortCursor = 0
-	for i, opt := range sortOptions {
-		if opt == m.sortOrder {
-			m.sortCursor = i
-			break
-		}
-	}
-	return m, nil, true
-}
-
-func handleKeySearch(m Model) (Model, tea.Cmd, bool) {
-	m.searching = true
-	m.searchInput.Focus()
-	return m, textinput.Blink, true
-}
-
-func handleKeyNextMatch(m Model) (Model, tea.Cmd, bool) {
-	m.nextMatch()
-	return m, nil, true
-}
-
-func handleKeyPrevMatch(m Model) (Model, tea.Cmd, bool) {
-	m.prevMatch()
+	m.sortPicker.SetCurrent(m.sortPicker.Current()) // reseed cursor to match today's active order
 	return m, nil, true
 }
 
 func handleKeyEsc(m Model) (Model, tea.Cmd, bool) {
-	if len(m.statusFilters) > 0 {
-		m.statusFilters = nil
-		m.clampCursorAndRefreshSearch()
-		m.updateViewportContent()
-	} else {
-		m.clearSearch()
-	}
-	return m, nil, true
-}
-
-func handleKeyCollapseCurrent(m Model) (Model, tea.Cmd, bool) {
-	if m.setCurrentFoldCollapsed(true) {
-		m.updateViewportContent()
-		m.ensureCursorVisible()
+	if len(m.filterPicker.Selected) > 0 {
+		for k := range m.filterPicker.Selected {
+			delete(m.filterPicker.Selected, k)
+		}
+		m.rebuildTree()
 		return m, nil, true
 	}
-
-	filtered := m.displayedResourceIndices()
-	if len(filtered) > 0 && m.cursor >= 0 && m.cursor < len(filtered) {
-		m.expanded[filtered[m.cursor]] = false
-		m.blockCursor = -1
-	}
-	m.updateViewportContent()
-	m.ensureCursorVisible()
-	return m, nil, true
-}
-
-func handleKeyHalfPageDown(m Model) (Model, tea.Cmd, bool) {
-	m.scrollHalfPageDown()
-	return m, nil, true
-}
-
-func handleKeyHalfPageUp(m Model) (Model, tea.Cmd, bool) {
-	m.scrollHalfPageUp()
-	return m, nil, true
-}
-
-func handleKeyScrollLineDown(m Model) (Model, tea.Cmd, bool) {
-	m.viewport.SetYOffset(m.viewport.YOffset + 1)
-	return m, nil, true
-}
-
-func handleKeyScrollLineUp(m Model) (Model, tea.Cmd, bool) {
-	newOffset := m.viewport.YOffset - 1
-	if newOffset < 0 {
-		newOffset = 0
-	}
-	m.viewport.SetYOffset(newOffset)
-	return m, nil, true
+	newTV, cmd := m.treeView.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.treeView = newTV.(foldtree.TreeView)
+	return m, cmd, true
 }
 
 func handleKeyIncreaseDiffContext(m Model) (Model, tea.Cmd, bool) {
 	m.diffContext = clampDiffContext(m.diffContextSize() + diffContextStep)
-	m.updateViewportContent()
-	m.ensureCursorVisible()
+	m.rebuildTree() // diffContext changes rendered heights
 	return m, nil, true
 }
 
 func handleKeyDecreaseDiffContext(m Model) (Model, tea.Cmd, bool) {
 	m.diffContext = clampDiffContext(m.diffContextSize() - diffContextStep)
-	m.updateViewportContent()
-	m.ensureCursorVisible()
-	return m, nil, true
-}
-
-func handleKeyG(m Model) (Model, tea.Cmd, bool) {
-	m.handleGKey()
-	return m, nil, true
-}
-
-func handleKeyGG(m Model) (Model, tea.Cmd, bool) {
-	m.gotoBottom()
-	return m, nil, true
-}
-
-func handleKeyPgUp(m Model) (Model, tea.Cmd, bool) {
-	m.viewport.GotoTop()
-	m.viewport.SetYOffset(m.viewport.YOffset - m.viewport.Height)
-	return m, nil, true
-}
-
-func handleKeyPgDown(m Model) (Model, tea.Cmd, bool) {
-	m.viewport.SetYOffset(m.viewport.YOffset + m.viewport.Height)
-	return m, nil, true
-}
-
-func handleKeyExpandCurrent(m Model) (Model, tea.Cmd, bool) {
-	if m.setCurrentFoldCollapsed(false) {
-		m.updateViewportContent()
-		m.ensureCursorVisible()
-		return m, nil, true
-	}
-
-	filtered := m.displayedResourceIndices()
-	if len(filtered) > 0 && m.cursor >= 0 && m.cursor < len(filtered) {
-		m.expanded[filtered[m.cursor]] = true
-	}
-	m.updateViewportContent()
-	m.scrollForExpanded()
+	m.rebuildTree()
 	return m, nil, true
 }
 
 func handleKeyApply(m Model) (Model, tea.Cmd, bool) {
 	if m.applyMode {
 		if m.confirmApply {
-			m.shouldApply = true
-			return m, tea.Quit, true
+			return m.startApply()
 		}
 		m.confirmApply = true
-		m.updateViewportContent()
 	}
 	return m, nil, true
 }
 
 func handleKeyConfirmApply(m Model) (Model, tea.Cmd, bool) {
 	if m.applyMode && m.confirmApply {
-		m.shouldApply = true
-		return m, tea.Quit, true
+		return m.startApply()
 	}
 	return m, nil, true
 }
 
-// handleNormalKey handles key presses in normal (non-search) mode
+// startApply confirms the apply and kicks off runner.ApplyStream as a
+// tea.Cmd -- the TUI keeps running and rendering throughout, unlike the
+// old flow where confirming apply quit the program and main.go ran
+// terraform/tofu directly on the bare terminal afterward.
+func (m Model) startApply() (Model, tea.Cmd, bool) {
+	m.confirmApply = false
+	m.applying = true
+	return m, m.startApplyCmd(), true
+}
+
+// applyStreamStartedMsg carries the channels ApplyStream returns, once
+// the apply subprocess has actually started.
+type applyStreamStartedMsg struct {
+	lines <-chan runner.ApplyLine
+	done  <-chan error
+}
+
+// applyLineMsg is one streamed line of `apply` output.
+type applyLineMsg runner.ApplyLine
+
+// applyDoneMsg reports the apply subprocess's final result.
+type applyDoneMsg struct{ err error }
+
+func (m Model) startApplyCmd() tea.Cmd {
+	tfCommand, planFile := m.tfCommand, m.planFile
+	return func() tea.Msg {
+		lines, done := runner.ApplyStream(context.Background(), runner.TFCommand(tfCommand), planFile)
+		return applyStreamStartedMsg{lines: lines, done: done}
+	}
+}
+
+// waitForApplyEvent blocks for exactly one line (or, once the stream is
+// exhausted, the final result) and returns it as a tea.Msg; the Update
+// case handling applyLineMsg re-arms this itself, so the model keeps
+// pumping the channels one message at a time for as long as apply runs.
+func waitForApplyEvent(lines <-chan runner.ApplyLine, done <-chan error) tea.Cmd {
+	return func() tea.Msg {
+		if line, ok := <-lines; ok {
+			return applyLineMsg(line)
+		}
+		return applyDoneMsg{err: <-done}
+	}
+}
+
+// handleNormalKey handles key presses in normal (non-search, non-picker)
+// mode: terraprism-specific keys are handled directly; everything else
+// is forwarded to treeView. A pending apply confirmation is cancelled by
+// any key other than 'a'/'y', whether or not that key was one tui itself
+// recognized.
 func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
-	if key != "g" && key != "G" {
-		m.pendingG = false
+
+	var result Model
+	var cmd tea.Cmd
+	if handler, ok := tuiKeyHandlers[key]; ok {
+		result, cmd, _ = handler(m)
+	} else {
+		newTV, c := m.treeView.Update(msg)
+		result = m
+		result.treeView = newTV.(foldtree.TreeView)
+		cmd = c
 	}
 
-	if handler, ok := normalKeyHandlers[key]; ok {
-		newM, cmd, _ := handler(m)
-		if m.confirmApply && key != "a" && key != "y" {
-			newM.confirmApply = false
-			newM.updateViewportContent()
-		}
-		return newM, cmd
+	if m.confirmApply && key != "a" && key != "y" {
+		result.confirmApply = false
 	}
-
-	if m.confirmApply {
-		m.confirmApply = false
-		m.updateViewportContent()
-	}
-	return m, nil
+	return result, cmd
 }
 
 // handleFilterKey handles key presses in filter picker mode
 func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.statusFilters = nil
+	switch m.filterPicker.Update(msg) {
+	case foldtree.PickerCancel:
+		// Esc clears all filters and closes, matching the picker's own
+		// footer hint ("Esc: clear all and close").
+		for k := range m.filterPicker.Selected {
+			delete(m.filterPicker.Selected, k)
+		}
 		m.filtering = false
-		m.clampCursorAndRefreshSearch()
-		m.updateViewportContent()
-		return m, nil
-
-	case "enter":
-		// Toggle on Space, apply and close on Enter (when not toggling)
-		// Enter toggles too per plan - "Space/Enter: toggle selected status on/off"
-		// So Enter both toggles and... the plan says "Enter: Apply and close". Let me re-read.
-		// "Space/Enter: toggle selected status on/off" and "Enter: Apply and close"
-		// So Enter toggles the current selection AND applies/closes? Or Enter just applies?
-		// Typical UX: Space toggles, Enter applies and closes. So we need to not toggle on Enter, just close.
-		// Actually "Enter (when not toggling): apply filters and close" - so Enter = apply and close, don't toggle.
+		m.rebuildTree()
+	case foldtree.PickerApply:
 		m.filtering = false
-		m.clampCursorAndRefreshSearch()
-		m.updateViewportContent()
-		return m, nil
-
-	case "up", "k":
-		if m.filterCursor > 0 {
-			m.filterCursor--
-		}
-		return m, nil
-
-	case "down", "j":
-		if m.filterCursor < len(filterableActions)-1 {
-			m.filterCursor++
-		}
-		return m, nil
-
-	case " ":
-		// Space toggles the selected status
-		action := filterableActions[m.filterCursor]
-		m.statusFilters[action] = !m.statusFilters[action]
-		return m, nil
-
-	case "a":
-		// Select all
-		for _, action := range filterableActions {
-			m.statusFilters[action] = true
-		}
-		return m, nil
-
-	case "c":
-		// Clear all filters (show all)
-		m.statusFilters = make(map[tfplan.Action]bool)
-		return m, nil
+		m.rebuildTree()
 	}
-
 	return m, nil
 }
 
 // handleSortKey handles key presses in sort picker mode
 func (m Model) handleSortKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
+	switch m.sortPicker.Update(msg) {
+	case foldtree.PickerCancel:
 		m.sorting = false
-		m.updateViewportContent()
-		return m, nil
-
-	case "enter", " ":
-		m.sortOrder = sortOptions[m.sortCursor]
+	case foldtree.PickerApply:
+		m.sortPicker.SetCurrent(m.sortPicker.Highlighted())
 		m.sorting = false
-		m.clampCursorAndRefreshSearch()
-		m.updateViewportContent()
-		return m, nil
-
-	case "up", "k":
-		if m.sortCursor > 0 {
-			m.sortCursor--
-		}
-		return m, nil
-
-	case "down", "j":
-		if m.sortCursor < len(sortOptions)-1 {
-			m.sortCursor++
-		}
-		return m, nil
+		m.rebuildTree()
 	}
-
 	return m, nil
 }
 
-// clampCursorAndRefreshSearch clamps cursor to valid range after filter/sort change and re-runs search
-func (m *Model) clampCursorAndRefreshSearch() {
-	displayed := m.displayedResourceIndices()
-	if m.cursor >= len(displayed) {
-		if len(displayed) > 0 {
-			m.cursor = len(displayed) - 1
-		} else {
-			m.cursor = 0
-		}
+// rebuildTree reconstructs the navigable tree for every currently
+// displayed resource and hands it to treeView, applying one-time default
+// collapse state (resources start collapsed; blocks whose fully-expanded
+// size is large default to collapsed too) for any node ID never seen
+// before. Must run whenever membership (filter/sort), size (diffContext),
+// or wrap width (resize) changes, since a node's declared Height must
+// always match exactly what RenderRow will draw for it. Search narrowing
+// is handled entirely inside treeView and needs no rebuild of its own.
+func (m *Model) rebuildTree() {
+	displayed := m.sortedResources()
+	roots := make([]foldtree.Node, len(displayed))
+	for i, idx := range displayed {
+		roots[i] = m.buildResourceNode(m.plan.Resources[idx])
 	}
-	m.blockCursor = -1
-	if m.searchQuery != "" {
-		m.performSearch()
-	}
+
+	m.treeView.SetTree(roots)
+	// Trailing chrome appended after the rows in render(): a blank line,
+	// the "End of Plan" marker, and a full viewport's worth of padding
+	// so the last resource's content can scroll fully into view.
+	m.treeView.SetExtraPadding(2 + m.treeView.Height())
+	m.applyDefaultCollapse(m.treeView.State(), roots)
 }
 
-func (m Model) currentResourceIndex() int {
-	displayed := m.displayedResourceIndices()
-	if len(displayed) == 0 || m.cursor < 0 || m.cursor >= len(displayed) {
-		return -1
-	}
-	return displayed[m.cursor]
-}
-
-// currentFoldBlocks returns the fold blocks currently visible (i.e. not
-// hidden inside a collapsed ancestor) for the cursor's resource, in
-// display order — used for blockCursor navigation.
-func (m Model) currentFoldBlocks() []foldBlock {
-	resourceIdx := m.currentResourceIndex()
-	if resourceIdx < 0 || resourceIdx >= len(m.plan.Resources) {
-		return nil
-	}
-	r := m.plan.Resources[resourceIdx]
-	return flattenFoldableAttributes(r.Address, r.Attributes, 0, m.resolveCollapsed)
-}
-
-func (m *Model) currentFoldBlock() (foldBlock, bool) {
-	blocks := m.currentFoldBlocks()
-	if m.blockCursor < 0 || m.blockCursor >= len(blocks) {
-		return foldBlock{}, false
-	}
-	return blocks[m.blockCursor], true
-}
-
-func (m *Model) toggleCurrentFold() bool {
-	block, ok := m.currentFoldBlock()
-	if !ok {
-		return false
-	}
-	m.foldedBlocks[block.Key] = !m.isFoldCollapsed(block)
-	return true
-}
-
-func (m *Model) setCurrentFoldCollapsed(collapsed bool) bool {
-	block, ok := m.currentFoldBlock()
-	if !ok {
-		return false
-	}
-	m.foldedBlocks[block.Key] = collapsed
-	return true
-}
-
-// setCurrentScopeFoldsCollapsed sets the collapsed state of the cursor's
-// current fold block and all its descendants (structurally, regardless of
-// their current visibility), or of the whole resource's fold tree when no
-// sub-fold is selected.
-func (m *Model) setCurrentScopeFoldsCollapsed(collapsed bool) bool {
-	resourceIdx := m.currentResourceIndex()
-	if resourceIdx < 0 || resourceIdx >= len(m.plan.Resources) || !m.expanded[resourceIdx] {
-		return false
-	}
-
-	r := m.plan.Resources[resourceIdx]
-	blocks := allFoldableAttributes(r.Address, r.Attributes, 0)
-	if len(blocks) == 0 {
-		return false
-	}
-
-	if current, ok := m.currentFoldBlock(); ok {
-		changed := false
-		for _, block := range blocks {
-			if block.Path == current.Path || isDescendantPath(block.Path, current.Path) {
-				m.foldedBlocks[block.Key] = collapsed
-				changed = true
+// applyDefaultCollapse collapses resources and large blocks the first
+// time their ID is ever seen, without touching anything the user (or a
+// previous default) has already decided. Walks the just-built node
+// forest directly (rather than the flattened, visibility-filtered
+// Rows()) so a node hidden behind an already-collapsed ancestor still
+// gets its default applied.
+func (m *Model) applyDefaultCollapse(nav *foldtree.State, roots []foldtree.Node) {
+	var walk func(n foldtree.Node)
+	walk = func(n foldtree.Node) {
+		if !m.defaultsApplied[n.ID] {
+			m.defaultsApplied[n.ID] = true
+			if info, ok := n.Payload.(rowInfo); ok {
+				switch info.kind {
+				case rowResource:
+					nav.SetCollapsed(n.ID, true)
+				case rowContainerHeader, rowMultilineHeader:
+					if countRenderedLines(info.attr) >= defaultCollapsedFoldLines {
+						nav.SetCollapsed(n.ID, true)
+					}
+				}
 			}
 		}
-		return changed
-	}
-
-	for _, block := range blocks {
-		m.foldedBlocks[block.Key] = collapsed
-	}
-	return true
-}
-
-func (m *Model) setDisplayedFoldsCollapsed(collapsed bool) {
-	for _, resourceIdx := range m.displayedResourceIndices() {
-		if resourceIdx < 0 || resourceIdx >= len(m.plan.Resources) {
-			continue
-		}
-		r := m.plan.Resources[resourceIdx]
-		for _, block := range allFoldableAttributes(r.Address, r.Attributes, 0) {
-			m.foldedBlocks[block.Key] = collapsed
+		for _, c := range n.Children {
+			walk(c)
 		}
 	}
-}
-
-// expandEverything expands all visible resources and their nested fold blocks.
-func (m *Model) expandEverything() {
-	for _, idx := range m.displayedResourceIndices() {
-		m.expanded[idx] = true
-	}
-	m.setDisplayedFoldsCollapsed(false)
-	m.blockCursor = -1
-	m.updateViewportContent()
-	m.ensureCursorVisible()
-}
-
-// collapseEverything collapses all visible resources and their nested fold blocks.
-func (m *Model) collapseEverything() {
-	for _, idx := range m.displayedResourceIndices() {
-		m.expanded[idx] = false
-	}
-	m.setDisplayedFoldsCollapsed(true)
-	m.blockCursor = -1
-	m.updateViewportContent()
-	m.ensureCursorVisible()
-}
-
-// nextMatch moves to the next search match
-func (m *Model) nextMatch() {
-	if m.searchQuery == "" || len(m.searchMatches) == 0 {
-		return
-	}
-	displayed := m.displayedResourceIndices()
-	if len(displayed) > 0 {
-		m.currentMatch = (m.currentMatch + 1) % len(displayed)
-		m.cursor = m.currentMatch
-		m.updateViewportContent()
-		m.ensureCursorVisible()
+	for _, r := range roots {
+		walk(r)
 	}
 }
 
-// prevMatch moves to the previous search match
-func (m *Model) prevMatch() {
-	if m.searchQuery == "" || len(m.searchMatches) == 0 {
-		return
-	}
-	displayed := m.displayedResourceIndices()
-	if len(displayed) > 0 {
-		m.currentMatch--
-		if m.currentMatch < 0 {
-			m.currentMatch = len(displayed) - 1
+// RenderRow implements foldtree.RowRenderer. It never reads mutable Model
+// state (diffContext-dependent content is already baked into each row's
+// Payload at tree-build time in foldtree_adapter.go; row.Collapsed comes
+// from the row itself; width/searchQuery are passed in) -- which is what
+// makes it safe to hand a Model snapshot to foldtree.NewTreeView once, at
+// construction, and never update it again.
+func (m Model) RenderRow(row foldtree.Row, selected bool, width int, searchQuery string) string {
+	info, _ := row.Payload.(rowInfo)
+	switch info.kind {
+	case rowResource:
+		if selected {
+			return m.renderSelectedResourceLine(info.resource, !row.Collapsed, width)
 		}
-		m.cursor = m.currentMatch
-		m.updateViewportContent()
-		m.ensureCursorVisible()
+		return m.renderResourceLine(info.resource, !row.Collapsed, searchQuery)
+
+	case rowContainerHeader:
+		indent := strings.Repeat("  ", row.Depth)
+		open, _ := containerBrackets(info.attr.Kind)
+		return m.renderFoldHeader(indent, info.attr, info.keyed, row.Collapsed, selected, width, open, containerFoldSummary(info.attr))
+
+	case rowMultilineHeader:
+		indent := strings.Repeat("  ", row.Depth)
+		return m.renderFoldHeader(indent, info.attr, info.keyed, row.Collapsed, selected, width, "<<EOT", multilineFoldSummary(info.attr))
+
+	default: // leaf, sensitive, userdata, multilineBody, closingBracket, eot, unchangedNote
+		if selected {
+			return m.applySelectedHighlight(info.text, width)
+		}
+		return info.text
 	}
 }
 
-// clearSearch clears the current search
-func (m *Model) clearSearch() {
-	m.searchQuery = ""
-	m.searchMatches = []int{}
-	m.searchInput.SetValue("")
-	m.updateViewportContent()
-}
-
-// scrollHalfPageDown scrolls viewport half page down
-func (m *Model) scrollHalfPageDown() {
-	halfPage := m.viewport.Height / 2
-	m.viewport.SetYOffset(m.viewport.YOffset + halfPage)
-}
-
-// scrollHalfPageUp scrolls viewport half page up
-func (m *Model) scrollHalfPageUp() {
-	halfPage := m.viewport.Height / 2
-	newOffset := m.viewport.YOffset - halfPage
-	if newOffset < 0 {
-		newOffset = 0
-	}
-	m.viewport.SetYOffset(newOffset)
-}
-
-// handleGKey handles the g key for gg navigation
-func (m *Model) handleGKey() {
-	if m.pendingG {
-		m.cursor = 0
-		m.updateViewportContent()
-		m.viewport.GotoTop()
-		m.pendingG = false
+// EmptyMessage implements foldtree.RowRenderer.
+func (m Model) EmptyMessage(searchQuery string) string {
+	var msg string
+	if searchQuery != "" {
+		msg = fmt.Sprintf("No resources match search '%s'. Press Esc to clear.", searchQuery)
 	} else {
-		m.pendingG = true
+		msg = "No resources match the current filters. Press 'f' to change filters."
 	}
+	return mutedColor.Render(msg) + "\n"
 }
 
-// gotoBottom moves cursor to the last visible resource and scrolls so it's visible
-func (m *Model) gotoBottom() {
-	displayed := m.displayedResourceIndices()
-	if len(displayed) > 0 {
-		m.cursor = len(displayed) - 1
-	}
-	m.updateViewportContent()
-	m.ensureCursorVisible()
-	m.pendingG = false
-}
+// applySelectedHighlight applies the same full-width background
+// highlight used for fold headers/resource rows to a row that has no
+// selected-specific rendering of its own. Handles multi-line cached text
+// (a wrapped leaf, a userdata block, a multiline diff body) by padding
+// and highlighting each line individually rather than treating the
+// whole blob as one line.
+func (m Model) applySelectedHighlight(plain string, width int) string {
+	style := lipgloss.NewStyle().Background(selectedBg).Foreground(textColor)
 
-// fuzzyMatch returns true if all characters in query appear in text in order
-// (not necessarily consecutive). E.g. "lmbda" matches "lambda", "inst" matches "instance".
-func fuzzyMatch(text, query string) bool {
-	text = strings.ToLower(text)
-	query = strings.ToLower(query)
-	if query == "" {
-		return true
-	}
-	qi := 0
-	for i := 0; i < len(text) && qi < len(query); i++ {
-		if text[i] == query[qi] {
-			qi++
+	lines := strings.Split(plain, "\n")
+	for i, line := range lines {
+		plainLen := utf8.RuneCountInString(stripANSI(line))
+		if width > 0 && plainLen < width {
+			line += strings.Repeat(" ", width-plainLen)
 		}
+		lines[i] = style.Render(line)
 	}
-	return qi == len(query)
-}
-
-func (m *Model) performSearch() {
-	m.searchMatches = []int{}
-	m.currentMatch = 0
-
-	if m.searchQuery == "" {
-		return // displayedResourceIndices will show full list
-	}
-
-	terms := strings.Fields(strings.ToLower(m.searchQuery))
-	if len(terms) == 0 {
-		return
-	}
-
-	filtered := m.sortedResources()
-	for displayIdx, resourceIdx := range filtered {
-		r := m.plan.Resources[resourceIdx]
-		searchable := strings.ToLower(r.Address + " " + r.Type + " " + r.Name)
-
-		allMatch := true
-		for _, term := range terms {
-			if !fuzzyMatch(searchable, term) {
-				allMatch = false
-				break
-			}
-		}
-		if allMatch {
-			m.searchMatches = append(m.searchMatches, displayIdx)
-		}
-	}
-
-	if len(m.searchMatches) > 0 {
-		m.cursor = 0 // first item in filtered display
-		m.currentMatch = 0
-		m.blockCursor = -1
-	}
-}
-
-func (m *Model) updateViewportContent() {
-	if !m.ready {
-		return
-	}
-	m.viewport.SetContent(m.renderResources())
-}
-
-// ensureCursorVisible scrolls the viewport to make the current cursor visible
-func (m *Model) ensureCursorVisible() {
-	if !m.ready {
-		return
-	}
-
-	if m.cursor < 0 || m.cursor >= len(m.resourceLineStarts) {
-		return
-	}
-
-	lineNum := m.selectedLineStart
-	if lineNum < 0 {
-		lineNum = m.resourceLineStarts[m.cursor]
-	}
-
-	topLine := m.viewport.YOffset
-	bottomLine := topLine + m.viewport.Height - 1
-
-	if lineNum < topLine {
-		m.viewport.SetYOffset(lineNum)
-	} else if lineNum > bottomLine {
-		newOffset := lineNum - m.viewport.Height + 1
-		if newOffset < 0 {
-			newOffset = 0
-		}
-		m.viewport.SetYOffset(newOffset)
-	}
-}
-
-// cursorLineVisible reports whether the current selection is already
-// within the viewport's visible line range. Used at list boundaries
-// (cursor already on the first/last item) to distinguish "the mouse
-// wheel scrolled the view away from the cursor, so this boundary
-// keypress should snap back to it" from "the view is already where the
-// cursor is, so this keypress means free-scroll past the edge."
-func (m *Model) cursorLineVisible() bool {
-	if !m.ready || m.cursor < 0 || m.cursor >= len(m.resourceLineStarts) {
-		return true
-	}
-	lineNum := m.selectedLineStart
-	if lineNum < 0 {
-		lineNum = m.resourceLineStarts[m.cursor]
-	}
-	topLine := m.viewport.YOffset
-	bottomLine := topLine + m.viewport.Height - 1
-	return lineNum >= topLine && lineNum <= bottomLine
-}
-
-// scrollPastBoundary handles a keypress that can't move the cursor any
-// further (already at the first/last item) by either free-scrolling one
-// line past the edge or snapping back to the cursor, depending on
-// whether the mouse wheel has scrolled the view away from it.
-//
-// Free-scrolling stops for good once the selected line reaches the near
-// edge of the viewport in the direction of travel, rather than
-// continuing until the line is pushed just out of view: cursorLineVisible
-// treats a line sitting exactly on the boundary as still visible, so
-// scrolling one more line makes it invisible, which would make the very
-// next press's "not visible -> snap back" case immediately undo the
-// scroll — an unstable two-step oscillation instead of a settled state.
-func (m *Model) scrollPastBoundary(down bool) {
-	if !m.cursorLineVisible() {
-		m.ensureCursorVisible()
-		return
-	}
-	topLine := m.viewport.YOffset
-	bottomLine := topLine + m.viewport.Height - 1
-	if down {
-		if m.selectedLineStart > topLine {
-			m.viewport.SetYOffset(topLine + 1)
-		}
-		return
-	}
-	if m.selectedLineStart < bottomLine {
-		m.viewport.SetYOffset(topLine - 1)
-	}
-}
-
-// scrollForExpanded ensures the cursor is visible and, when expanded,
-// positions the cursor near the top so the expanded content is visible below.
-func (m *Model) scrollForExpanded() {
-	if !m.ready || m.cursor < 0 || m.cursor >= len(m.resourceLineStarts) {
-		return
-	}
-
-	lineNum := m.resourceLineStarts[m.cursor]
-	filtered := m.sortedResources()
-	resourceIdx := -1
-	if m.cursor < len(filtered) {
-		resourceIdx = filtered[m.cursor]
-	}
-
-	if resourceIdx >= 0 && m.expanded[resourceIdx] {
-		var endLine int
-		if m.cursor+1 < len(m.resourceLineStarts) {
-			endLine = m.resourceLineStarts[m.cursor+1]
-		} else {
-			endLine = m.contentLineCount
-		}
-
-		bottomLine := m.viewport.YOffset + m.viewport.Height - 1
-		if endLine > bottomLine {
-			m.viewport.SetYOffset(lineNum)
-			return
-		}
-	}
-
-	m.ensureCursorVisible()
-}
-
-func (m *Model) renderResources() string {
-	var b strings.Builder
-	lineCount := 0
-
-	displayed := m.displayedResourceIndices()
-	m.resourceLineStarts = make([]int, len(displayed))
-
-	if len(displayed) == 0 {
-		if m.searchQuery != "" {
-			b.WriteString(mutedColor.Render(fmt.Sprintf("No resources match search '%s'. Press Esc to clear.", m.searchQuery)))
-		} else {
-			b.WriteString(mutedColor.Render("No resources match the current filters. Press 'f' to change filters."))
-		}
-		b.WriteString("\n")
-		return b.String()
-	}
-
-	m.selectedLineStart = 0
-	for displayIdx, resourceIdx := range displayed {
-		m.resourceLineStarts[displayIdx] = lineCount
-		r := m.plan.Resources[resourceIdx]
-
-		isSelected := displayIdx == m.cursor
-		isExpanded := m.expanded[resourceIdx]
-		isMatch := m.searchQuery != "" // when filtering, all displayed items match
-		if isSelected && m.blockCursor < 0 {
-			m.selectedLineStart = lineCount
-		}
-
-		if isSelected {
-			line := m.renderSelectedResourceLine(r, isExpanded, isMatch)
-			b.WriteString(line)
-		} else {
-			line := m.renderResourceLine(r, isExpanded, isMatch)
-			b.WriteString(line)
-		}
-		b.WriteString("\n")
-		lineCount++
-
-		if isExpanded && len(r.Attributes) > 0 {
-			foldIdx := 0
-			m.renderAttributeTree(&b, r.Address, r.Attributes, 0, true, isSelected && m.blockCursor >= 0, &foldIdx, &lineCount)
-			b.WriteString("\n")
-			lineCount++
-		}
-	}
-
-	m.contentLineCount = lineCount
-
-	b.WriteString("\n")
-	eolStyle := lipgloss.NewStyle().Foreground(mutedColorVal)
-	b.WriteString(eolStyle.Render("── End of Plan ──"))
-	b.WriteString("\n")
-
-	// Padding after the marker so the viewport has room to scroll
-	// the last resource's expanded content fully into view
-	for i := 0; i < m.viewport.Height; i++ {
-		b.WriteString("\n")
-	}
-
-	return b.String()
+	return strings.Join(lines, "\n")
 }
 
 const defaultCollapsedFoldLines = 30
 
-// foldBlock is one collapsible container attribute (a map or list with
-// children) within a resource's attribute tree.
-type foldBlock struct {
-	Key   string // address + "#" + Path; stable across re-renders
-	Path  string
-	Attr  tfplan.Attribute
-	Depth int
-}
-
 func foldKey(address, path string) string {
 	return address + "#" + path
-}
-
-// isDescendantPath reports whether path is nested under ancestorPath
-// (a dotted attribute path or bracketed list-index path).
-func isDescendantPath(path, ancestorPath string) bool {
-	return strings.HasPrefix(path, ancestorPath+".") || strings.HasPrefix(path, ancestorPath+"[")
 }
 
 // isContainerAttr reports whether an attribute is a non-empty, non-sensitive
@@ -1295,15 +707,6 @@ func isDescendantPath(path, ancestorPath string) bool {
 // nested children.
 func isContainerAttr(a tfplan.Attribute) bool {
 	return (a.Kind == tfplan.KindMap || a.Kind == tfplan.KindList) && len(a.Children) > 0 && !a.Sensitive
-}
-
-// isFoldableAttr reports whether an attribute renders as a foldable block
-// at all — either a container (nested children) or a multi-line string
-// (diffed content with no children of its own). Both get an
-// expand/collapse indicator and a default-collapse-by-size heuristic;
-// only containers recurse into Children.
-func isFoldableAttr(a tfplan.Attribute) bool {
-	return isContainerAttr(a) || isMultilineStringAttr(a)
 }
 
 // countRenderedLines estimates how many lines a foldable attribute would
@@ -1342,55 +745,6 @@ func multilineLineEstimate(a tfplan.Attribute) int {
 	return newLines
 }
 
-// allFoldableAttributes returns every foldable attribute in the tree,
-// structurally, regardless of current fold state. Used by "expand/collapse
-// scope" operations, which must reach descendants even when an
-// intermediate ancestor happens to be currently collapsed.
-func allFoldableAttributes(address string, attrs []tfplan.Attribute, depth int) []foldBlock {
-	var blocks []foldBlock
-	for _, a := range attrs {
-		if !isFoldableAttr(a) {
-			continue
-		}
-		blocks = append(blocks, foldBlock{Key: foldKey(address, a.Path), Path: a.Path, Attr: a, Depth: depth})
-		if isContainerAttr(a) {
-			blocks = append(blocks, allFoldableAttributes(address, a.Children, depth+1)...)
-		}
-	}
-	return blocks
-}
-
-// flattenFoldableAttributes returns the fold blocks currently visible:
-// like allFoldableAttributes, but stops descending into a container once
-// it's collapsed, matching what renderAttributeTree actually draws.
-func flattenFoldableAttributes(address string, attrs []tfplan.Attribute, depth int, isCollapsed func(key string, size int) bool) []foldBlock {
-	var blocks []foldBlock
-	for _, a := range attrs {
-		if !isFoldableAttr(a) {
-			continue
-		}
-		key := foldKey(address, a.Path)
-		blocks = append(blocks, foldBlock{Key: key, Path: a.Path, Attr: a, Depth: depth})
-		if isContainerAttr(a) && !isCollapsed(key, countRenderedLines(a)) {
-			blocks = append(blocks, flattenFoldableAttributes(address, a.Children, depth+1, isCollapsed)...)
-		}
-	}
-	return blocks
-}
-
-// resolveCollapsed looks up an explicit fold-state override, falling back
-// to the default-collapse-by-size heuristic.
-func (m *Model) resolveCollapsed(key string, size int) bool {
-	if collapsed, ok := m.foldedBlocks[key]; ok {
-		return collapsed
-	}
-	return size >= defaultCollapsedFoldLines
-}
-
-func (m *Model) isFoldCollapsed(block foldBlock) bool {
-	return m.resolveCollapsed(block.Key, countRenderedLines(block.Attr))
-}
-
 // renderFoldHeader renders a fold block's header row: the expand/collapse
 // indicator, diff-action symbol, and "name = <opener>" (or just <opener>
 // when keyed is false, i.e. a positional list element), with
@@ -1419,13 +773,9 @@ func (m Model) renderFoldHeader(indent string, attr tfplan.Attribute, keyed, col
 		return result
 	}
 
-	targetWidth := m.width - 4
-	if targetWidth <= 0 {
-		targetWidth = maxWidth
-	}
 	plainLen := utf8.RuneCountInString(stripANSI(result))
-	if targetWidth > 0 && plainLen < targetWidth {
-		result += strings.Repeat(" ", targetWidth-plainLen)
+	if maxWidth > 0 && plainLen < maxWidth {
+		result += strings.Repeat(" ", maxWidth-plainLen)
 	}
 	return lipgloss.NewStyle().Background(selectedBg).Foreground(textColor).Render(result)
 }
@@ -1694,114 +1044,8 @@ func (m Model) renderLeafRow(indent string, attr tfplan.Attribute, keyed bool, m
 	return b.String()
 }
 
-// renderAttributeTree recursively renders a resource's (or a container
-// attribute's) children, applying fold state, multiline-string diffing,
-// userdata decoding, and sensitive/computed styling. keyed controls
-// whether each attribute prints its own "name = " prefix: true for
-// resource-level attributes and map entries, false for positional list
-// elements. foldIdx and lineCount are threaded through so the caller can
-// track blockCursor position and total rendered line count exactly as
-// before.
-//
-// Terraform's JSON plan always carries the resource's full before/after
-// state, not just the diff, so most attributes of a partially-changed
-// resource are unchanged context rather than part of the actual change.
-// Showing every one of them individually — even muted — buries the real
-// diff and is exactly what confused review of real-world plans. Terraform
-// CLI's own text renderer solves this by collapsing runs of unchanged
-// attributes into a single "# (N unchanged attributes hidden)" note; this
-// mirrors that convention rather than rendering them one by one.
-func (m *Model) renderAttributeTree(b *strings.Builder, address string, attrs []tfplan.Attribute, depth int, keyed bool, selected bool, foldIdx *int, lineCount *int) {
-	maxWidth := m.viewport.Width
-	indent := strings.Repeat("  ", depth)
-
-	for i := 0; i < len(attrs); i++ {
-		attr := attrs[i]
-
-		if attr.Action == tfplan.ActionNoOp {
-			run := 1
-			for i+run < len(attrs) && attrs[i+run].Action == tfplan.ActionNoOp {
-				run++
-			}
-			b.WriteString(indent + fastMuted.Render(unchangedHiddenNote(run)))
-			b.WriteString("\n")
-			*lineCount++
-			i += run - 1
-			continue
-		}
-
-		if keyed {
-			if decoded, ok := m.tryRenderUserdataAttr(attr, indent, maxWidth); ok {
-				b.WriteString(decoded)
-				b.WriteString("\n")
-				*lineCount += strings.Count(decoded, "\n") + 1
-				continue
-			}
-		}
-
-		if isContainerAttr(attr) {
-			key := foldKey(address, attr.Path)
-			collapsed := m.resolveCollapsed(key, countRenderedLines(attr))
-			blockSelected := selected && *foldIdx == m.blockCursor
-			if blockSelected {
-				m.selectedLineStart = *lineCount
-			}
-			open, _ := containerBrackets(attr.Kind)
-			b.WriteString(m.renderFoldHeader(indent, attr, keyed, collapsed, blockSelected, maxWidth, open, containerFoldSummary(attr)))
-			b.WriteString("\n")
-			*lineCount++
-			*foldIdx++
-
-			if !collapsed {
-				childKeyed := attr.Kind == tfplan.KindMap
-				m.renderAttributeTree(b, address, attr.Children, depth+1, childKeyed, selected, foldIdx, lineCount)
-				b.WriteString(closingBraceLine(indent, attr.Kind))
-				b.WriteString("\n")
-				*lineCount++
-			}
-			continue
-		}
-
-		if attr.Sensitive {
-			row := indent + actionPrefixSymbol(attr.Action) + " " + renderKeyValue(attr, keyed)
-			b.WriteString(row)
-			b.WriteString("\n")
-			*lineCount++
-			continue
-		}
-
-		if isMultilineStringAttr(attr) {
-			key := foldKey(address, attr.Path)
-			collapsed := m.resolveCollapsed(key, countRenderedLines(attr))
-			blockSelected := selected && *foldIdx == m.blockCursor
-			if blockSelected {
-				m.selectedLineStart = *lineCount
-			}
-			b.WriteString(m.renderFoldHeader(indent, attr, keyed, collapsed, blockSelected, maxWidth, "<<EOT", multilineFoldSummary(attr)))
-			b.WriteString("\n")
-			*lineCount++
-			*foldIdx++
-
-			if !collapsed {
-				body := m.renderMultilineStringBody(attr, indent, maxWidth)
-				b.WriteString(body)
-				*lineCount += strings.Count(body, "\n")
-				b.WriteString(indent + fastMuted.Render("EOT"))
-				b.WriteString("\n")
-				*lineCount++
-			}
-			continue
-		}
-
-		row := m.renderLeafRow(indent, attr, keyed, maxWidth)
-		b.WriteString(row)
-		b.WriteString("\n")
-		*lineCount += strings.Count(row, "\n") + 1
-	}
-}
-
 // renderSelectedResourceLine renders a resource line with full-width background highlight
-func (m Model) renderSelectedResourceLine(r tfplan.Resource, expanded bool, _ bool) string {
+func (m Model) renderSelectedResourceLine(r tfplan.Resource, expanded bool, width int) string {
 	// Build the line content
 	var content strings.Builder
 
@@ -1847,9 +1091,8 @@ func (m Model) renderSelectedResourceLine(r tfplan.Resource, expanded bool, _ bo
 
 	// Pad to full width and apply selected style with foreground color
 	line := content.String()
-	targetWidth := m.width - 4
-	if targetWidth > 0 && len(line) < targetWidth {
-		line = line + strings.Repeat(" ", targetWidth-len(line))
+	if width > 0 && len(line) < width {
+		line = line + strings.Repeat(" ", width-len(line))
 	}
 
 	// Apply style with both foreground and background
@@ -1861,7 +1104,7 @@ func (m Model) renderSelectedResourceLine(r tfplan.Resource, expanded bool, _ bo
 	return actionStyle.Render(line)
 }
 
-func (m Model) renderResourceLine(r tfplan.Resource, expanded bool, isMatch bool) string {
+func (m Model) renderResourceLine(r tfplan.Resource, expanded bool, searchQuery string) string {
 	var b strings.Builder
 
 	// Expand/collapse indicator
@@ -1880,9 +1123,9 @@ func (m Model) renderResourceLine(r tfplan.Resource, expanded bool, isMatch bool
 	style := GetResourceStyle(string(r.Action))
 	address := r.Address
 
-	if isMatch && m.searchQuery != "" {
+	if searchQuery != "" {
 		// Highlight matching text
-		address = highlightMatch(address, m.searchQuery)
+		address = highlightMatch(address, searchQuery)
 	}
 
 	b.WriteString(style.Render(address))
@@ -2003,20 +1246,7 @@ func (m Model) viewFilterPicker() string {
 	var b strings.Builder
 	b.WriteString(searchStyle.Render("Filter by status (Space: toggle, a: all, c: clear, Enter: apply, Esc: clear all and close)"))
 	b.WriteString("\n\n")
-	for i, action := range filterableActions {
-		checked := "[ ]"
-		if m.statusFilters != nil && m.statusFilters[action] {
-			checked = "[x]"
-		}
-		label := filterActionLabel(action)
-		rowStyle := lipgloss.NewStyle().Foreground(textColor)
-		if i == m.filterCursor {
-			rowStyle = rowStyle.Background(selectedBg)
-		}
-		labelStyle := GetResourceStyle(string(action))
-		b.WriteString(rowStyle.Render("  "+checked+" ") + labelStyle.Render(label))
-		b.WriteString("\n")
-	}
+	b.WriteString(m.filterPicker.View())
 	b.WriteString("\n")
 	b.WriteString(helpStyle.Render("j/k: navigate • Space: toggle • a: select all • c: clear all • Enter: apply • Esc: clear all and close"))
 	return appStyle.Render(b.String())
@@ -2027,19 +1257,7 @@ func (m Model) viewSortPicker() string {
 	var b strings.Builder
 	b.WriteString(searchStyle.Render("Sort by (Enter/Space: select, Esc: close)"))
 	b.WriteString("\n\n")
-	for i, opt := range sortOptions {
-		marker := "  "
-		if opt == m.sortOrder {
-			marker = "● "
-		}
-		rowStyle := lipgloss.NewStyle().Foreground(textColor)
-		if i == m.sortCursor {
-			rowStyle = rowStyle.Background(selectedBg)
-		}
-		line := marker + sortOrderLabel(opt) + " " + mutedColor.Render(sortOrderHint(opt))
-		b.WriteString(rowStyle.Render(line))
-		b.WriteString("\n")
-	}
+	b.WriteString(m.sortPicker.View())
 	b.WriteString("\n")
 	b.WriteString(helpStyle.Render("j/k: navigate • Enter/Space: select • Esc: close"))
 	return appStyle.Render(b.String())
@@ -2067,12 +1285,12 @@ func (m Model) viewHeader() string {
 
 // viewFilterStatus renders the filter status line when filters are active.
 func (m Model) viewFilterStatus() string {
-	if len(m.statusFilters) == 0 {
+	if len(m.filterPicker.Selected) == 0 {
 		return ""
 	}
 	var labels []string
 	for _, action := range filterableActions {
-		if m.statusFilters[action] {
+		if m.filterPicker.Selected[action] {
 			labels = append(labels, filterActionLabel(action))
 		}
 	}
@@ -2081,25 +1299,26 @@ func (m Model) viewFilterStatus() string {
 
 // viewSortStatus renders the sort status line when not default.
 func (m Model) viewSortStatus() string {
-	if m.sortOrder == SortDefault || m.sortOrder == "" {
+	order := m.sortPicker.Current()
+	if order == SortDefault || order == "" {
 		return ""
 	}
-	return searchStyle.Render(fmt.Sprintf("Sort: %s • s: change", sortOrderLabel(m.sortOrder))) + "\n\n"
+	return searchStyle.Render(fmt.Sprintf("Sort: %s • s: change", sortOrderLabel(order))) + "\n\n"
 }
 
-// viewSearchBar renders the search bar or match info.
-func (m Model) viewSearchBar() string {
-	if m.searching {
-		return searchStyle.Render("Search: ") + m.searchInput.View() + "\n\n"
-	}
-	if m.searchQuery != "" {
-		return searchStyle.Render(fmt.Sprintf("Search: %q (%d/%d matches)", m.searchQuery, m.currentMatch+1, len(m.searchMatches))) + "\n\n"
-	}
-	return ""
-}
-
-// viewConfirmationPrompt renders the apply confirmation prompt.
+// viewConfirmationPrompt renders the apply confirmation prompt, or (once
+// confirmed) a status banner for as long as the apply subprocess is
+// still running -- mutually exclusive with each other and with the
+// pre-confirmation prompt.
 func (m Model) viewConfirmationPrompt() string {
+	if m.applying {
+		style := lipgloss.NewStyle().
+			Background(updateColor).
+			Foreground(textColor).
+			Bold(true).
+			Padding(0, 2)
+		return "\n" + style.Render("⏳ Applying... quit is disabled until it finishes") + "\n\n"
+	}
 	if !m.confirmApply {
 		return ""
 	}
@@ -2115,7 +1334,11 @@ func (m Model) viewConfirmationPrompt() string {
 func (m Model) viewHelpFooter() string {
 	maxWidth := m.width - 4
 	if maxWidth <= 0 {
-		maxWidth = m.viewport.Width
+		maxWidth = m.treeView.Width()
+	}
+
+	if m.applying {
+		return "Applying... quit disabled until it finishes • o: toggle output"
 	}
 
 	if m.applyMode {
@@ -2123,11 +1346,15 @@ func (m Model) viewHelpFooter() string {
 			return "y: confirm apply • any key: cancel"
 		}
 		applyHint := lipgloss.NewStyle().Foreground(createColor).Bold(true).Render("a: APPLY")
-		full := fmt.Sprintf("%s • j/k/↑↓: navigate • e/c: scope • E/C: all • /: search • f: filter • s: sort • q: quit", applyHint)
+		outputHint := ""
+		if m.planOutput != "" {
+			outputHint = " • o: output"
+		}
+		full := fmt.Sprintf("%s • j/k/↑↓: navigate • e/c: scope • E/C: all • /: search • f: filter • s: sort%s • q: quit", applyHint, outputHint)
 		if lipgloss.Width(full) <= maxWidth {
 			return full
 		}
-		medium := fmt.Sprintf("%s • j/k nav • e/c scope • E/C all • / search • q", applyHint)
+		medium := fmt.Sprintf("%s • j/k nav • e/c scope • E/C all • / search%s • q", applyHint, outputHint)
 		if lipgloss.Width(medium) <= maxWidth {
 			return medium
 		}
@@ -2141,7 +1368,7 @@ func (m Model) viewHelpFooter() string {
 		"j/k nav • l/h fold • e/c • q",
 	}
 
-	if len(m.statusFilters) > 0 {
+	if len(m.filterPicker.Selected) > 0 {
 		for i, help := range helpOptions {
 			helpOptions[i] = help + " • Esc clears filter"
 		}
@@ -2180,9 +1407,13 @@ func (m Model) View() string {
 	b.WriteString(m.viewHeader())
 	b.WriteString(m.viewFilterStatus())
 	b.WriteString(m.viewSortStatus())
-	b.WriteString(m.viewSearchBar())
+	b.WriteString(m.treeView.ViewSearchBar(func(s string) string { return searchStyle.Render(s) }))
 	b.WriteString(m.viewConfirmationPrompt())
-	b.WriteString(m.viewport.View())
+	if m.outputPane.Visible() {
+		b.WriteString(lipgloss.JoinVertical(lipgloss.Left, m.treeView.View(), m.outputPane.View()))
+	} else {
+		b.WriteString(m.treeView.View())
+	}
 	b.WriteString("\n")
 	b.WriteString(helpStyle.Render(m.viewHelpFooter()))
 	b.WriteString(m.viewUpdateNudge())

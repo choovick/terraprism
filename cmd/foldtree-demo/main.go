@@ -233,6 +233,15 @@ func padTo(s string, width int) string {
 }
 
 func main() {
+	// --rich is a separate startup mode, not an in-program toggle: Bubble
+	// Tea can't hot-swap a running program's root model, so choosing
+	// between the bare-State demo and the fuller TreeView/Picker demo has
+	// to happen before tea.NewProgram is ever constructed.
+	if len(os.Args) > 1 && os.Args[1] == "--rich" {
+		runRichDemo()
+		return
+	}
+
 	p := tea.NewProgram(newModel(), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

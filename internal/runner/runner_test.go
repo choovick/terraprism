@@ -29,6 +29,15 @@ case "$1" in
     exit "${FAKE_TF_SHOW_EXIT:-0}"
     ;;
   apply)
+    if [ -n "$FAKE_TF_APPLY_LINES" ]; then
+      old_ifs="$IFS"
+      IFS='|'
+      for line in $FAKE_TF_APPLY_LINES; do
+        echo "$line"
+        sleep 0.01
+      done
+      IFS="$old_ifs"
+    fi
     exit "${FAKE_TF_APPLY_EXIT:-0}"
     ;;
 esac
@@ -49,6 +58,7 @@ func writeFakeTF(t *testing.T) string {
 
 func TestRunPlanSuccess(t *testing.T) {
 	t.Setenv("FAKE_TF_SHOW_STDOUT", validPlanJSON)
+	t.Setenv("FAKE_TF_PLAN_STDOUT", "Plan: 1 to add, 0 to change, 0 to destroy.\n")
 	fake := writeFakeTF(t)
 
 	result, err := RunPlan(context.Background(), Options{Cmd: TFCommand(fake)})
@@ -63,6 +73,9 @@ func TestRunPlanSuccess(t *testing.T) {
 	}
 	if len(result.RawJSON) == 0 {
 		t.Errorf("RawJSON should not be empty")
+	}
+	if len(result.Output) == 0 {
+		t.Errorf("Output should carry the plan invocation's captured stdout even on success")
 	}
 }
 
@@ -129,27 +142,59 @@ func TestRunPlanInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestApply(t *testing.T) {
-	tests := []struct {
-		name    string
-		exit    string
-		wantErr bool
-	}{
-		{name: "success", exit: "0", wantErr: false},
-		{name: "failure", exit: "1", wantErr: true},
+func TestApplyStreamDeliversLinesInOrderThenDoneOnSuccess(t *testing.T) {
+	t.Setenv("FAKE_TF_APPLY_LINES", "creating...|still creating...|apply complete!")
+	fake := writeFakeTF(t)
+
+	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+
+	var got []string
+	for l := range lines {
+		got = append(got, l.Text)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("FAKE_TF_APPLY_EXIT", tc.exit)
-			fake := writeFakeTF(t)
-			err := Apply(context.Background(), TFCommand(fake), "/dev/null")
-			if tc.wantErr && err == nil {
-				t.Errorf("expected error")
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-		})
+	want := []string{"creating...", "still creating...", "apply complete!"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines, want %d: %v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("line %d = %q, want %q", i, got[i], w)
+		}
+	}
+
+	// lines must be fully drained and closed before done fires.
+	if err := <-done; err != nil {
+		t.Errorf("expected nil error on success, got %v", err)
+	}
+}
+
+func TestApplyStreamSurfacesNonzeroExit(t *testing.T) {
+	t.Setenv("FAKE_TF_APPLY_LINES", "creating...")
+	t.Setenv("FAKE_TF_APPLY_EXIT", "1")
+	fake := writeFakeTF(t)
+
+	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+
+	for range lines {
+		// drain
+	}
+	if err := <-done; err == nil {
+		t.Fatalf("expected a non-nil error for a nonzero exit")
+	}
+}
+
+func TestApplyStreamPassesAutoApprove(t *testing.T) {
+	// The fake script ignores extra args entirely for "apply", so this
+	// only confirms ApplyStream doesn't fail to invoke the command when
+	// -auto-approve is present -- a real terraform/tofu binary would
+	// reject an interactive-approval flow otherwise, since ApplyStream
+	// never connects the subprocess's stdin to a terminal.
+	fake := writeFakeTF(t)
+	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+	for range lines {
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

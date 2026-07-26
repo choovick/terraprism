@@ -209,7 +209,14 @@ func runApplyMode(args []string, isDestroy bool) {
 		os.Exit(0)
 	}
 
-	model := tui.NewModelWithApply(plan, planFile, tfCmd, version)
+	// Apply itself now runs *inside* the TUI (tui.Model.startApplyCmd,
+	// via runner.ApplyStream) once the user confirms, rather than after
+	// the program exits: the TUI stays up and renders live progress in
+	// its output pane, and blocks quitting until the subprocess is done.
+	// By the time p.Run() returns, any apply that was started is
+	// guaranteed finished -- which is also what keeps the deferred
+	// os.Remove(planFile) above safe.
+	model := tui.NewModelWithApply(plan, planFile, tfCmd, version, string(result.Output))
 	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := p.Run()
 	if err != nil {
@@ -217,21 +224,22 @@ func runApplyMode(args []string, isDestroy bool) {
 		os.Exit(1)
 	}
 
-	if m, ok := finalModel.(tui.Model); ok && m.ShouldApply() {
-		fmt.Printf("\nApplying plan with %s...\n\n", tfCmd)
-		applyErr := runner.Apply(ctx, runner.TFCommand(tfCmd), planFile)
-		if applyErr != nil {
-			fmt.Fprintf(os.Stderr, "\nApply failed: %v\n", applyErr)
-			updateHistoryApplyResult(historyPath, false)
-			os.Exit(1)
-		}
-		fmt.Println("\nApply complete!")
-		updateHistoryApplyResult(historyPath, true)
-	} else {
+	m, ok := finalModel.(tui.Model)
+	switch {
+	case !ok:
+		// Unreachable: finalModel is always the tui.Model this function built.
+	case !m.ApplyAttempted():
 		fmt.Println("\nApply cancelled.")
 		if historyPath != "" {
 			_, _ = history.UpdateFilenameWithStatus(historyPath, history.StatusCancelled)
 		}
+	case m.ApplyResult() == nil:
+		fmt.Println("\nApply complete!")
+		updateHistoryApplyResult(historyPath, true)
+	default:
+		fmt.Fprintf(os.Stderr, "\nApply failed: %v\n", m.ApplyResult())
+		updateHistoryApplyResult(historyPath, false)
+		os.Exit(1)
 	}
 }
 
@@ -797,8 +805,9 @@ CONTROLS:
     e/c         Expand/collapse all
     /           Search resources
     n/N         Next/previous match
-    a           Apply (only in apply mode)
-    q/Esc       Quit
+    a           Apply (only in apply mode); a then y streams live output
+    o           Toggle the plan/apply output pane (apply mode only)
+    q/Esc       Quit (disabled while an apply is in progress)
 
 HISTORY:
     All plan and apply outputs are saved to ~/.terraprism/
@@ -836,8 +845,10 @@ USAGE:
     terraprism apply [-- terraform-args]
 
 DESCRIPTION:
-    Runs terraform/tofu plan, displays in interactive TUI for review,
-    then applies if you press 'a'.
+    Runs terraform/tofu plan, displays in interactive TUI for review, then
+    applies if you press 'a' then 'y'. Apply runs inside the TUI itself,
+    streaming its output live into a toggleable pane ('o') rather than
+    exiting to the plain terminal first.
 
     All output is saved to ~/.terraprism/ for history.
 
@@ -850,8 +861,9 @@ TERRAFORM ARGS:
 
 CONTROLS IN TUI:
     a           Apply the plan
-    y           Confirm apply
-    q/Esc       Cancel and quit
+    y           Confirm apply (starts a live-streamed apply)
+    o           Toggle the plan/apply output pane
+    q/Esc       Cancel and quit (disabled while an apply is running)
 
 EXAMPLES:
     terraprism apply

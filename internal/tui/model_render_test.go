@@ -6,9 +6,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/CaptShanks/terraprism/internal/foldtree"
 	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
 
@@ -46,21 +47,50 @@ func withPaths(attrs []tfplan.Attribute, parent string) []tfplan.Attribute {
 	return out
 }
 
-// renderResourceForTest renders a resource's attribute tree the way
-// Model.renderAttributeTree does when the resource is expanded, with a
-// fresh Model (no cursor/fold overrides beyond what the caller sets on r).
-func renderResourceForTest(r tfplan.Resource, diffContext int) string {
-	m := Model{
-		viewport:     viewport.New(120, 40),
-		foldedBlocks: make(map[string]bool),
-		blockCursor:  -1,
-		diffContext:  diffContext,
-	}
+// buildTestResourceModel builds a Model with a real tree for r, via the
+// same adapter + one-time default-collapse the app uses on initial load,
+// so tests exercise the real code path rather than a bespoke test-only
+// renderer.
+func buildTestResourceModel(r tfplan.Resource, diffContext int) Model {
+	m := Model{diffContext: diffContext, defaultsApplied: make(map[string]bool)}
+	m.treeView = *foldtree.NewTreeView(m)
+	newTV, _ := m.treeView.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.treeView = newTV.(foldtree.TreeView)
+
+	node := m.buildResourceNode(r)
+	m.treeView.SetTree([]foldtree.Node{node})
+	m.applyDefaultCollapse(m.treeView.State(), []foldtree.Node{node})
+	// Resources start collapsed by default in the real app; these tests
+	// are about attribute-level rendering, so expand the resource root
+	// itself (matching the old helper's scope, which had no resource-
+	// level collapse concept at all).
+	m.treeView.State().SetCollapsed(r.Address, false)
+	return m
+}
+
+// renderModelRows renders every row except skipID (typically the
+// resource's own header line, to match the old renderAttributeTree-only
+// test scope), unselected.
+func renderModelRows(m *Model, skipID string) string {
 	var b strings.Builder
-	foldIdx := 0
-	lineCount := 0
-	m.renderAttributeTree(&b, r.Address, r.Attributes, 0, true, false, &foldIdx, &lineCount)
+	width := m.treeView.Width()
+	query := m.treeView.SearchQuery()
+	for _, row := range m.treeView.State().Rows() {
+		if row.ID == skipID {
+			continue
+		}
+		b.WriteString(m.RenderRow(row, false, width, query))
+		b.WriteString("\n")
+	}
 	return stripRenderANSI(b.String())
+}
+
+// renderResourceForTest renders a resource's attribute tree the way the
+// app does on initial load (real adapter + one-time default collapse),
+// skipping the resource's own header line.
+func renderResourceForTest(r tfplan.Resource, diffContext int) string {
+	m := buildTestResourceModel(r, diffContext)
+	return renderModelRows(&m, r.Address)
 }
 
 // Terraform's JSON plan carries the resource's full before/after state,
@@ -181,24 +211,15 @@ func TestLargeMultilineStringDiffIsFoldable(t *testing.T) {
 		t.Fatalf("collapsed multiline content should be hidden:\n%s", got)
 	}
 
-	// Expanding it (via blockCursor + toggle) reveals the content and
-	// flips the indicator, exactly like a container fold.
-	m := Model{
-		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
-		expanded:     map[int]bool{0: true},
-		foldedBlocks: make(map[string]bool),
-		blockCursor:  0,
-		viewport:     viewport.New(120, 40),
+	// Expanding it reveals the content and flips the indicator, exactly
+	// like a container fold.
+	m := buildTestResourceModel(r, 0)
+	valuesID := foldKey(r.Address, "values")
+	if !m.treeView.State().IsCollapsed(valuesID) {
+		t.Fatal("expected the multiline attribute to be a navigable, default-collapsed fold block")
 	}
-	if !m.setCurrentFoldCollapsed(false) {
-		t.Fatal("expected the multiline attribute to be a navigable fold block")
-	}
-
-	var b strings.Builder
-	foldIdx := 0
-	lineCount := 0
-	m.renderAttributeTree(&b, r.Address, r.Attributes, 0, true, false, &foldIdx, &lineCount)
-	expanded := stripRenderANSI(b.String())
+	m.treeView.State().SetCollapsed(valuesID, false)
+	expanded := renderModelRows(&m, r.Address)
 
 	if !strings.Contains(expanded, "▼ ~ values = <<EOT") {
 		t.Fatalf("expected an expanded fold header after toggling:\n%s", expanded)
@@ -243,31 +264,29 @@ func TestDiffContextControlsMultilineContextLines(t *testing.T) {
 }
 
 func TestDiffContextHotkeysClampContext(t *testing.T) {
-	m := Model{
-		plan:        &tfplan.Plan{},
-		viewport:    viewport.New(80, 20),
-		diffContext: defaultDiffContext,
-	}
+	m := NewModel(&tfplan.Plan{}, "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	mm := model.(Model)
 
-	m, _, handled := handleKeyIncreaseDiffContext(m)
+	mm, _, handled := handleKeyIncreaseDiffContext(mm)
 	if !handled {
 		t.Fatal("expected increase diff context key to be handled")
 	}
-	if got, want := m.diffContextSize(), defaultDiffContext+diffContextStep; got != want {
+	if got, want := mm.diffContextSize(), defaultDiffContext+diffContextStep; got != want {
 		t.Fatalf("diff context after increase = %d, want %d", got, want)
 	}
 
 	for i := 0; i < 20; i++ {
-		m, _, _ = handleKeyIncreaseDiffContext(m)
+		mm, _, _ = handleKeyIncreaseDiffContext(mm)
 	}
-	if got := m.diffContextSize(); got != maxDiffContext {
+	if got := mm.diffContextSize(); got != maxDiffContext {
 		t.Fatalf("diff context should clamp to max %d, got %d", maxDiffContext, got)
 	}
 
 	for i := 0; i < 20; i++ {
-		m, _, _ = handleKeyDecreaseDiffContext(m)
+		mm, _, _ = handleKeyDecreaseDiffContext(mm)
 	}
-	if got := m.diffContextSize(); got != 0 {
+	if got := mm.diffContextSize(); got != 0 {
 		t.Fatalf("diff context should clamp to 0, got %d", got)
 	}
 }
@@ -287,74 +306,80 @@ func nestedMetadataResource() tfplan.Resource {
 
 func TestVisibleFoldBlocksExcludesChildrenOfCollapsedParent(t *testing.T) {
 	r := nestedMetadataResource()
-	m := Model{
-		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
-		expanded:     map[int]bool{0: true},
-		foldedBlocks: make(map[string]bool),
-		blockCursor:  -1,
-	}
-	blocks := allFoldableAttributes(r.Address, r.Attributes, 0)
-	if len(blocks) != 2 {
-		t.Fatalf("expected parent and child folds, got %d", len(blocks))
+	m := buildTestResourceModel(r, 0)
+	m.treeView.State().ExpandAll()
+
+	metadataID := foldKey(r.Address, "metadata")
+	valuesID := foldKey(r.Address, "metadata.values")
+
+	visible := func(id string) bool {
+		for _, row := range m.treeView.State().Rows() {
+			if row.ID == id {
+				return true
+			}
+		}
+		return false
 	}
 
-	m.foldedBlocks[blocks[0].Key] = true
-	visible := m.currentFoldBlocks()
-	if len(visible) != 1 {
-		t.Fatalf("expected only collapsed parent to be visible, got %d", len(visible))
+	if !visible(valuesID) {
+		t.Fatal("setup: expected metadata.values visible while parent expanded")
 	}
-	if visible[0].Key != blocks[0].Key {
-		t.Fatalf("expected visible fold to be parent, got %q", visible[0].Key)
+
+	m.treeView.State().SetCollapsed(metadataID, true)
+	if visible(valuesID) {
+		t.Fatal("expected metadata.values to be hidden once its parent is collapsed")
 	}
 }
 
 func TestVisibleFoldBlocksIncludesChildrenOfExpandedParent(t *testing.T) {
 	r := nestedMetadataResource()
-	m := Model{
-		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
-		expanded:     map[int]bool{0: true},
-		foldedBlocks: make(map[string]bool),
-		blockCursor:  -1,
-	}
+	m := buildTestResourceModel(r, 0)
+	m.treeView.State().ExpandAll()
 
-	visible := m.currentFoldBlocks()
-	if len(visible) != 2 {
-		t.Fatalf("expected parent and child folds to be visible, got %d", len(visible))
+	metadataID := foldKey(r.Address, "metadata")
+	valuesID := foldKey(r.Address, "metadata.values")
+
+	mi, vi := -1, -1
+	for i, row := range m.treeView.State().Rows() {
+		if row.ID == metadataID {
+			mi = i
+		}
+		if row.ID == valuesID {
+			vi = i
+		}
 	}
-	if visible[0].Path != "metadata" || visible[1].Path != "metadata.values" {
-		t.Fatalf("unexpected visible fold order: %#v", visible)
+	if mi < 0 || vi < 0 {
+		t.Fatalf("expected both metadata and metadata.values visible (metadata=%d, values=%d)", mi, vi)
+	}
+	if vi <= mi {
+		t.Fatalf("expected metadata.values to appear after metadata, got indices %d, %d", mi, vi)
 	}
 }
 
-func TestSetCurrentScopeFoldsCollapsedResourceScope(t *testing.T) {
+// ExpandSubtree/CollapseSubtree on a resource's own address must affect
+// the resource and every descendant fold, regardless of nesting depth --
+// the unified replacement for the old root-scope expand/collapse.
+func TestScopedCollapseAffectsResourceAndDescendants(t *testing.T) {
 	r := nestedMetadataResource()
-	m := Model{
-		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
-		expanded:     map[int]bool{0: true},
-		foldedBlocks: make(map[string]bool),
-		blockCursor:  -1,
+	m := buildTestResourceModel(r, 0)
+	m.treeView.State().ExpandAll()
+
+	metadataID := foldKey(r.Address, "metadata")
+
+	m.treeView.State().CollapseSubtree(r.Address)
+	if !m.treeView.State().IsCollapsed(r.Address) || !m.treeView.State().IsCollapsed(metadataID) {
+		t.Fatalf("expected resource-scope collapse to fold the resource and its descendants")
 	}
 
-	if !m.setCurrentScopeFoldsCollapsed(true) {
-		t.Fatal("expected resource-scope collapse to apply")
-	}
-	for _, block := range allFoldableAttributes(r.Address, r.Attributes, 0) {
-		if !m.foldedBlocks[block.Key] {
-			t.Fatalf("expected fold %q to be collapsed", block.Key)
-		}
-	}
-
-	if !m.setCurrentScopeFoldsCollapsed(false) {
-		t.Fatal("expected resource-scope expand to apply")
-	}
-	for _, block := range allFoldableAttributes(r.Address, r.Attributes, 0) {
-		if m.foldedBlocks[block.Key] {
-			t.Fatalf("expected fold %q to be expanded", block.Key)
-		}
+	m.treeView.State().ExpandSubtree(r.Address)
+	if m.treeView.State().IsCollapsed(r.Address) || m.treeView.State().IsCollapsed(metadataID) {
+		t.Fatalf("expected resource-scope expand to unfold the resource and its descendants")
 	}
 }
 
-func TestSetCurrentScopeFoldsCollapsedSubBlockScope(t *testing.T) {
+// Collapsing a specific sub-block (not the resource root) must not leak
+// to a sibling fold block.
+func TestScopedCollapseOnSubBlockDoesNotAffectSibling(t *testing.T) {
 	nested := leaf("nested", tfplan.ActionUpdate, tfplan.KindBool, false, true)
 	values := mapBlock("values", tfplan.ActionUpdate, nested)
 	metadata := mapBlock("metadata", tfplan.ActionUpdate, values)
@@ -364,76 +389,55 @@ func TestSetCurrentScopeFoldsCollapsedSubBlockScope(t *testing.T) {
 		Action:     tfplan.ActionUpdate,
 		Attributes: withPaths([]tfplan.Attribute{metadata, set}, ""),
 	}
-	m := Model{
-		plan:         &tfplan.Plan{Resources: []tfplan.Resource{r}},
-		expanded:     map[int]bool{0: true},
-		foldedBlocks: make(map[string]bool),
-		blockCursor:  0,
-	}
-	blocks := allFoldableAttributes(r.Address, r.Attributes, 0)
-	if len(blocks) != 3 {
-		t.Fatalf("expected metadata, values, and set folds, got %#v", blocks)
-	}
+	m := buildTestResourceModel(r, 0)
+	m.treeView.State().ExpandAll()
 
-	if !m.setCurrentScopeFoldsCollapsed(true) {
-		t.Fatal("expected sub-block-scope collapse to apply")
+	metadataID := foldKey(r.Address, "metadata")
+	valuesID := foldKey(r.Address, "metadata.values")
+	setID := foldKey(r.Address, "set")
+
+	m.treeView.State().CollapseSubtree(metadataID)
+
+	if !m.treeView.State().IsCollapsed(metadataID) || !m.treeView.State().IsCollapsed(valuesID) {
+		t.Fatalf("expected the selected fold and its descendant to collapse")
 	}
-	if !m.foldedBlocks[blocks[0].Key] || !m.foldedBlocks[blocks[1].Key] {
-		t.Fatalf("expected selected fold and descendant to collapse: %#v", m.foldedBlocks)
-	}
-	if m.foldedBlocks[blocks[2].Key] {
-		t.Fatalf("did not expect sibling fold to collapse: %#v", m.foldedBlocks)
+	if m.treeView.State().IsCollapsed(setID) {
+		t.Fatalf("did not expect sibling fold 'set' to collapse")
 	}
 }
 
-func TestExpandAndCollapseEverythingAffectsAllDisplayedResourcesAndFolds(t *testing.T) {
+// Shift+E/Shift+C (global expand/collapse) must reach nested folds, not
+// just resource roots.
+func TestExpandAndCollapseEverythingAffectsNestedFoldsToo(t *testing.T) {
 	metadata := mapBlock("metadata", tfplan.ActionUpdate,
 		mapBlock("values", tfplan.ActionUpdate, leaf("nested", tfplan.ActionUpdate, tfplan.KindBool, false, true)))
 	spec := mapBlock("spec", tfplan.ActionUpdate, leaf("replicas", tfplan.ActionUpdate, tfplan.KindNumber, "2", "3"))
 
 	resources := []tfplan.Resource{
-		{
-			Address:    "helm_release.chart",
-			Action:     tfplan.ActionUpdate,
-			Attributes: withPaths([]tfplan.Attribute{metadata}, ""),
-		},
-		{
-			Address:    "kubectl_manifest.vmagent",
-			Action:     tfplan.ActionUpdate,
-			Attributes: withPaths([]tfplan.Attribute{spec}, ""),
-		},
+		{Address: "helm_release.chart", Action: tfplan.ActionUpdate, Attributes: withPaths([]tfplan.Attribute{metadata}, "")},
+		{Address: "kubectl_manifest.vmagent", Action: tfplan.ActionUpdate, Attributes: withPaths([]tfplan.Attribute{spec}, "")},
 	}
-	m := Model{
-		plan:         &tfplan.Plan{Resources: resources},
-		expanded:     map[int]bool{0: false, 1: false},
-		foldedBlocks: make(map[string]bool),
-		blockCursor:  1,
+	m := newTestModel(resources)
+
+	ids := []string{
+		"helm_release.chart",
+		foldKey("helm_release.chart", "metadata"),
+		foldKey("helm_release.chart", "metadata.values"),
+		"kubectl_manifest.vmagent",
+		foldKey("kubectl_manifest.vmagent", "spec"),
 	}
 
-	m.expandEverything()
-	for idx := range resources {
-		if !m.expanded[idx] {
-			t.Fatalf("expected resource %d to be expanded", idx)
+	updated := pressKey(m, "E")
+	for _, id := range ids {
+		if updated.treeView.State().IsCollapsed(id) {
+			t.Fatalf("expected %q to be expanded by global expand", id)
 		}
-		for _, block := range allFoldableAttributes(resources[idx].Address, resources[idx].Attributes, 0) {
-			if m.foldedBlocks[block.Key] {
-				t.Fatalf("expected fold %q to be expanded", block.Key)
-			}
-		}
-	}
-	if m.blockCursor != -1 {
-		t.Fatalf("expected block cursor to reset after global expand, got %d", m.blockCursor)
 	}
 
-	m.collapseEverything()
-	for idx := range resources {
-		if m.expanded[idx] {
-			t.Fatalf("expected resource %d to be collapsed", idx)
-		}
-		for _, block := range allFoldableAttributes(resources[idx].Address, resources[idx].Attributes, 0) {
-			if !m.foldedBlocks[block.Key] {
-				t.Fatalf("expected fold %q to be collapsed", block.Key)
-			}
+	collapsed := pressKey(updated, "C")
+	for _, id := range ids {
+		if !collapsed.treeView.State().IsCollapsed(id) {
+			t.Fatalf("expected %q to be collapsed by global collapse", id)
 		}
 	}
 }

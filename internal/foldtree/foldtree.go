@@ -23,11 +23,16 @@ package foldtree
 // number of terminal lines this node's own row occupies when rendered
 // (independent of its children, which only appear as separate rows when
 // the node is expanded). A negative Height is treated as zero.
+//
+// Payload is caller-owned data associated with this node — foldtree never
+// inspects it, only carries it through to the corresponding Row so a
+// renderer or search predicate can type-assert it back out.
 type Node struct {
 	ID          string
 	Height      int
 	Collapsible bool
 	Children    []Node
+	Payload     any
 }
 
 // Row is one visible line-item after flattening a tree through a
@@ -38,6 +43,7 @@ type Row struct {
 	Height      int
 	HasChildren bool
 	Collapsed   bool
+	Payload     any
 }
 
 // Flatten walks roots in document (pre-)order, skipping the children of
@@ -71,6 +77,7 @@ func Flatten(roots []Node, isCollapsed func(id string) bool) []Row {
 			Height:      n.Height,
 			HasChildren: len(n.Children) > 0,
 			Collapsed:   collapsed,
+			Payload:     n.Payload,
 		})
 
 		if !collapsed {
