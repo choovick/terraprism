@@ -178,8 +178,12 @@ func newSortPicker() foldtree.Picker[SortOrder] {
 	return *p
 }
 
-// outputPaneHeight is how many lines the output pane occupies once shown.
-const outputPaneHeight = 12
+// treeHeightWithOutputVisible is how many lines the tree view keeps for
+// context when the output pane is open -- the pane itself takes the
+// rest of the content height, since it's usually the thing being
+// actively read (live plan/apply progress, or a captured log to search)
+// while it's open.
+const treeHeightWithOutputVisible = 6
 
 // newModel builds the shared TreeView+LogPane plumbing for both NewModel
 // and NewModelWithApply.
@@ -342,7 +346,10 @@ func (m *Model) reflow() {
 
 	treeHeight := contentHeight
 	if m.outputPane.Visible() {
-		treeHeight = contentHeight - outputPaneHeight
+		treeHeight = treeHeightWithOutputVisible
+	}
+	if treeHeight > contentHeight {
+		treeHeight = contentHeight
 	}
 	if treeHeight < 1 {
 		treeHeight = 1
@@ -384,6 +391,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.sorting {
 			return m.handleSortKey(msg)
 		}
+		if m.outputPane.Visible() && m.outputPane.SearchActive() {
+			newPane, cmd := m.outputPane.Update(msg)
+			m.outputPane = newPane.(foldtree.LogPane)
+			return m, cmd
+		}
 		if m.treeView.SearchActive() {
 			newTV, cmd := m.treeView.Update(msg)
 			m.treeView = newTV.(foldtree.TreeView)
@@ -392,6 +404,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleNormalKey(msg)
 
 	case tea.MouseMsg:
+		if m.outputPane.Visible() {
+			newPane, cmd := m.outputPane.Update(msg)
+			m.outputPane = newPane.(foldtree.LogPane)
+			return m, cmd
+		}
 		newTV, cmd := m.treeView.Update(msg)
 		m.treeView = newTV.(foldtree.TreeView)
 		return m, cmd
@@ -650,9 +667,12 @@ func waitForPlanEvent(lines <-chan runner.PlanLine, done <-chan runner.PlanStrea
 }
 
 // handleNormalKey handles key presses in normal (non-search, non-picker)
-// mode: terraprism-specific keys are handled directly; everything else
-// is forwarded to treeView. A pending apply confirmation is cancelled by
-// any key other than 'a'/'y', whether or not that key was one tui itself
+// mode: terraprism-specific keys (tuiKeyHandlers) are always handled
+// directly regardless of what else is visible, so 'o'/'q'/'a'/'y' etc.
+// stay reachable even while the output pane is open; everything else
+// (navigation, "/") goes to the output pane while it's visible, or
+// treeView otherwise. A pending apply confirmation is cancelled by any
+// key other than 'a'/'y', whether or not that key was one tui itself
 // recognized.
 func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
@@ -661,6 +681,11 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	if handler, ok := tuiKeyHandlers[key]; ok {
 		result, cmd, _ = handler(m)
+	} else if m.outputPane.Visible() {
+		newPane, c := m.outputPane.Update(msg)
+		result = m
+		result.outputPane = newPane.(foldtree.LogPane)
+		cmd = c
 	} else {
 		newTV, c := m.treeView.Update(msg)
 		result = m
@@ -1479,16 +1504,18 @@ func (m Model) viewHelpFooter() string {
 		maxWidth = m.treeView.Width()
 	}
 
-	if m.planning {
-		return "Running plan... quit disabled until it finishes • o: toggle output"
-	}
-
-	if m.planErr != nil {
-		return "Plan failed • o: toggle output • q: quit"
-	}
-
-	if m.applying {
-		return "Applying... quit disabled until it finishes • o: toggle output"
+	if m.outputPane.Visible() {
+		navHint := "j/k/gg/G: nav • /: search • n/N: cycle matches"
+		switch {
+		case m.planning:
+			return "Running plan... quit disabled • " + navHint + " • o: hide"
+		case m.planErr != nil:
+			return "Plan failed • " + navHint + " • o: hide • q: quit"
+		case m.applying:
+			return "Applying... quit disabled • " + navHint + " • o: hide"
+		default:
+			return navHint + " • o: hide output"
+		}
 	}
 
 	if m.applyMode {
@@ -1560,7 +1587,8 @@ func (m Model) View() string {
 	b.WriteString(m.treeView.ViewSearchBar(func(s string) string { return searchStyle.Render(s) }))
 	b.WriteString(m.viewConfirmationPrompt())
 	if m.outputPane.Visible() {
-		b.WriteString(lipgloss.JoinVertical(lipgloss.Left, m.treeView.View(), m.outputPane.View()))
+		paneSearchBar := m.outputPane.ViewSearchBar(func(s string) string { return searchStyle.Render(s) })
+		b.WriteString(lipgloss.JoinVertical(lipgloss.Left, m.treeView.View(), paneSearchBar+m.outputPane.View()))
 	} else {
 		b.WriteString(m.treeView.View())
 	}

@@ -145,3 +145,122 @@ func TestLogPaneUpdateForwardsToViewport(t *testing.T) {
 		t.Fatalf("Update should preserve the underlying viewport state")
 	}
 }
+
+func newTestLogPane(lines int) *LogPane {
+	p := NewLogPane()
+	p.SetSize(40, 3)
+	content := make([]string, lines)
+	for i := range content {
+		content[i] = fmt.Sprintf("line %d", i)
+	}
+	p.SetLines(content)
+	return p
+}
+
+func sendLogPaneKey(p *LogPane, s string) {
+	m, _ := p.Update(keyMsgFor(s))
+	*p = m.(LogPane)
+}
+
+func TestLogPaneGGAndShiftGJumpToTopAndBottom(t *testing.T) {
+	p := newTestLogPane(50)
+	sendLogPaneKey(p, "G")
+	if !p.viewport.AtBottom() {
+		t.Fatalf("expected 'G' to jump to the bottom")
+	}
+	sendLogPaneKey(p, "g")
+	sendLogPaneKey(p, "g")
+	if !p.viewport.AtTop() {
+		t.Fatalf("expected 'gg' to jump to the top")
+	}
+}
+
+func TestLogPaneJKForwardToViewport(t *testing.T) {
+	p := newTestLogPane(50)
+	before := p.viewport.YOffset
+	sendLogPaneKey(p, "j")
+	if p.viewport.YOffset <= before {
+		t.Fatalf("expected 'j' to scroll down, offset stayed at %d", p.viewport.YOffset)
+	}
+}
+
+// lineVisible reports whether line index i falls within the viewport's
+// current [YOffset, YOffset+Height) window -- the right check for "did
+// jumping to a match bring it into view," since SetYOffset clamps to
+// maxYOffset for matches near the end of a short document (a match can
+// be visible without YOffset exactly equaling its line index).
+func lineVisible(p *LogPane, i int) bool {
+	return i >= p.viewport.YOffset && i < p.viewport.YOffset+p.viewport.Height
+}
+
+func TestLogPaneSearchFindsAndCyclesMatches(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(40, 3)
+	p.SetLines([]string{"alpha", "nothing here", "beta match", "more filler", "another match line", "zzz"})
+
+	sendLogPaneKey(p, "/")
+	if !p.SearchActive() {
+		t.Fatalf("expected search to be active after '/'")
+	}
+	for _, r := range "match" {
+		sendLogPaneKey(p, string(r))
+	}
+	if len(p.matches) != 2 {
+		t.Fatalf("expected 2 matches for 'match', got %d: %v", len(p.matches), p.matches)
+	}
+	if !lineVisible(p, p.matches[0]) {
+		t.Fatalf("expected typing to scroll the first match (line %d) into view, got YOffset=%d", p.matches[0], p.viewport.YOffset)
+	}
+
+	sendLogPaneKey(p, "enter")
+	if p.SearchActive() {
+		t.Fatalf("expected search input to close after enter")
+	}
+
+	sendLogPaneKey(p, "n")
+	if p.matchPos != 1 || !lineVisible(p, p.matches[1]) {
+		t.Fatalf("expected 'n' to move to and scroll the next match (line %d) into view, got matchPos=%d YOffset=%d", p.matches[1], p.matchPos, p.viewport.YOffset)
+	}
+	sendLogPaneKey(p, "n") // wraps back to the first match
+	if p.matchPos != 0 || !lineVisible(p, p.matches[0]) {
+		t.Fatalf("expected 'n' to wrap to the first match (line %d), got matchPos=%d YOffset=%d", p.matches[0], p.matchPos, p.viewport.YOffset)
+	}
+}
+
+func TestLogPaneSearchEscClearsQueryAndMatches(t *testing.T) {
+	p := newTestLogPane(20)
+	sendLogPaneKey(p, "/")
+	sendLogPaneKey(p, "l")
+	sendLogPaneKey(p, "i")
+	sendLogPaneKey(p, "n")
+	sendLogPaneKey(p, "e")
+	if len(p.matches) == 0 {
+		t.Fatalf("setup: expected matches for 'line'")
+	}
+	sendLogPaneKey(p, "esc")
+	if p.SearchActive() {
+		t.Fatalf("expected esc to close the search input")
+	}
+	if p.searchQuery != "" || len(p.matches) != 0 {
+		t.Fatalf("expected esc to clear the query and matches, got query=%q matches=%v", p.searchQuery, p.matches)
+	}
+}
+
+func TestLogPaneViewSearchBarStates(t *testing.T) {
+	p := newTestLogPane(10)
+	if bar := p.ViewSearchBar(nil); bar != "" {
+		t.Fatalf("expected empty search bar when not searching, got %q", bar)
+	}
+	sendLogPaneKey(p, "/")
+	if bar := p.ViewSearchBar(nil); !strings.Contains(bar, "Search output:") {
+		t.Fatalf("expected a search prompt while typing, got %q", bar)
+	}
+	for _, r := range "line 3" {
+		sendLogPaneKey(p, string(r))
+	}
+	sendLogPaneKey(p, "enter")
+	bar := p.ViewSearchBar(nil)
+	if !strings.Contains(bar, "line 3") || !strings.Contains(bar, "1/1") {
+		t.Fatalf("expected an applied-query status line with a 1/1 match count, got %q", bar)
+	}
+}

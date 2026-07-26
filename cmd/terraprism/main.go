@@ -796,7 +796,8 @@ CONTROLS:
     /           Search resources
     n/N         Next/previous match
     a           Apply (only in apply mode); a then y streams live output
-    o           Toggle the plan/apply output pane
+    o           Toggle the plan/apply output pane (takes most of the
+                screen; has its own j/k/gg/G nav and / search while open)
     q/Esc       Quit (disabled while a plan or apply is in progress)
 
 HISTORY:
@@ -853,7 +854,8 @@ TERRAFORM ARGS:
 CONTROLS IN TUI:
     a           Apply the plan
     y           Confirm apply (starts a live-streamed apply)
-    o           Toggle the plan/apply output pane
+    o           Toggle the plan/apply output pane (takes most of the
+                screen; has its own j/k/gg/G nav and / search while open)
     q/Esc       Cancel and quit (disabled while a plan or apply is running)
 
 EXAMPLES:
