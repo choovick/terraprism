@@ -40,11 +40,13 @@ independent of the TUI or the runner.
 ```mermaid
 flowchart TD
     main["cmd/terraprism<br/><i>main.go — CLI entry point, command dispatch</i>"]
+    demo["cmd/foldtree-demo<br/><i>standalone playground for<br/>internal/foldtree, no plan data</i>"]
 
     runner["internal/runner<br/><i>shells out to terraform/tofu:<br/>plan → show -json → apply</i>"]
     tfplan["internal/tfplan<br/><i>decodes show -json into a<br/>pre-diffed Attribute tree</i>"]
     history["internal/history<br/><i>JSON envelope files<br/>in ~/.terraprism/</i>"]
     tui["internal/tui<br/><i>Bubble Tea interactive TUI +<br/>non-interactive print mode</i>"]
+    foldtree["internal/foldtree<br/><i>generic collapsible-tree nav:<br/>cursor + scroll offset, one State</i>"]
     updater["internal/updater<br/><i>GitHub release<br/>self-update</i>"]
 
     main --> runner
@@ -52,20 +54,24 @@ flowchart TD
     main --> history
     main --> tui
     main --> updater
+    demo --> foldtree
 
     runner --> tfplan
     tui --> tfplan
     tui --> history
     tui --> updater
+    tui --> foldtree
 ```
 
 | Package | Responsibility | Depends on |
 |---|---|---|
 | `cmd/terraprism` | Parses CLI args, dispatches to one of the run modes below, owns the "no changes" early exits | `history`, `runner`, `tfplan`, `tui`, `updater` |
+| `cmd/foldtree-demo` | Interactive playground exercising `internal/foldtree` directly against synthetic sample trees, independent of any plan data — for trying navigation feel in isolation | `foldtree` |
 | `internal/runner` | The **only** place that invokes the real `terraform`/`tofu` binary for plan/show/apply | `tfplan` |
 | `internal/tfplan` | Decodes `terraform show -json` via `hashicorp/terraform-json`, builds the pre-diffed `Attribute` tree, exposes plan-wide summary counts | *(none — leaf package)* |
 | `internal/history` | Persists/lists/renames plan & apply runs as JSON envelope files | *(none)* |
-| `internal/tui` | Renders a `*tfplan.Plan` — either interactively (Bubble Tea `Model`) or flat (`PrintPlan`) | `tfplan`, `history` (picker only), `updater` (update nudge) |
+| `internal/tui` | Renders a `*tfplan.Plan` — either interactively (Bubble Tea `Model`) or flat (`PrintPlan`) | `tfplan`, `history` (picker only), `updater` (update nudge), `foldtree` (interactive navigation) |
+| `internal/foldtree` | Generic collapsible-tree navigation: one `State` owns cursor position and viewport scroll offset together, with zero knowledge of Terraform data | *(none — leaf package)* |
 | `internal/updater` | Checks GitHub Releases for newer versions and self-updates the binary | *(none)* |
 
 ## Command Dispatch
@@ -257,38 +263,89 @@ Notable properties of this model:
   that the TUI already knows how to render, navigate, filter, and sort —
   so the rendering pipeline needs no separate code path for outputs.
 
-## Rendering Pipeline
+## Rendering & Navigation Pipeline
 
-`internal/tui` walks the `Attribute` tree recursively
-(`renderAttributeTree` for the interactive TUI, `printAttributeTree` for
-flat print mode — both follow the same logic). Because Terraform's JSON
-plan always carries the resource's *full* before/after state, most
-attributes of a partially-changed resource are unchanged context rather
-than part of the actual diff; those collapse into a single muted
-`# (N unchanged attributes hidden)` note (matching Terraform CLI's own
-convention) so the real change stays visible.
+Flat (`printAttributeTree`, print mode) rendering still walks the
+`Attribute` tree recursively and is unaffected by anything below — it has
+no cursor, no fold state, always fully expanded. The interactive TUI's
+pipeline is a two-stage process: an **adapter** turns a resource's
+`Attribute` tree into a generic, navigable tree once per structural
+change, then `internal/foldtree` owns cursor/scroll state over that tree
+independent of what it contains.
+
+### 1. Adapter: `Attribute` tree → `foldtree.Node` tree
+
+`buildResourceNode`/`buildAttributeNodes` (`internal/tui/foldtree_adapter.go`)
+mirror the same branching print mode uses (no-op run collapsing, userdata
+detection, container, sensitive, multi-line string, plain leaf), but
+build `foldtree.Node`s instead of writing text. Every attribute — leaf or
+foldable — becomes its own independently selectable node, not just
+containers/multi-line strings as in earlier iterations of this renderer:
 
 ```mermaid
 flowchart TD
-    A["renderAttributeTree(attrs)"] --> B{"run of consecutive<br/>ActionNoOp attributes?"}
-    B -- yes --> C["emit one '# (N unchanged<br/>attributes hidden)' line"]
-    B -- no, next attr --> D{"name is<br/>user_data / user_data_base64?"}
-    D -- yes --> E["decode (base64/gzip/hex)<br/>+ line diff"]
+    A["buildAttributeNodes(attrs, depth)"] --> B{"run of consecutive<br/>ActionNoOp attributes?"}
+    B -- yes --> C["one synthetic 'unchanged<br/>attributes hidden' node"]
+    B -- no, next attr --> D{"user_data /<br/>user_data_base64?"}
+    D -- yes --> E["decoded+diffed node<br/>(plain, non-foldable)"]
     D -- no --> F{"container?<br/>(Map/List with Children)"}
-    F -- yes --> G["render fold header<br/>(+/-/~, collapsed by size/override)"]
-    G -- expanded --> A
+    F -- yes --> G["header node (Height 1) +<br/>recurse into Children +<br/>synthetic closing-bracket node"]
+    G --> A
     F -- no --> H{"Sensitive?"}
-    H -- yes --> I["render '(sensitive value)'"]
+    H -- yes --> I["'(sensitive value)' node"]
     H -- no --> J{"multi-line string?<br/>(Old or New contains \n)"}
-    J -- yes --> K["ComputeDiff + ContextDiff<br/>line-by-line, no marker parsing needed"]
-    J -- no --> L["render 'name = value',<br/>old → new arrow if updated"]
+    J -- yes --> K["header node (Height 1) +<br/>synthetic diffed-body node +<br/>synthetic EOT node"]
+    J -- no --> L["plain leaf node,<br/>Height = actual rendered line count"]
 ```
 
-Fold/collapse state is keyed by `address + "#" + attribute.Path` (e.g.
-`aws_instance.web#tags`) rather than by line offset, so it stays stable
-across re-renders regardless of terminal width, diff-context setting, or
-search/sort/filter state — the previous text-based renderer's fold keys
-were line-offset-based and could drift.
+A node's `Height` is always derived by calling the real render function
+(`renderLeafRow`, `renderMultilineStringBody`, …) and counting the
+newlines it actually produces — never a parallel estimate — so scroll/
+paging math can never silently drift from what's on screen. Containers
+and multi-line strings declare `Height: 1` unconditionally (just their
+own header/summary line); their expanded content exists only as
+children, which `foldtree.Flatten` naturally omits while collapsed. A
+side-table (`rowInfo`, keyed by the same ID as the `Node`) carries what
+each row actually is, since `foldtree.Node`/`Row` deliberately carry no
+payload of their own.
+
+### 2. `internal/foldtree`: cursor + scroll, decoupled from the data
+
+`foldtree.State` flattens the `Node` tree into `Rows()` — respecting
+current collapse state — and owns cursor position and viewport scroll
+offset **together** in one place, so keyboard navigation and mouse-wheel
+scrolling can never disagree about "where we are" (the root cause of
+several navigation bugs in earlier iterations of this renderer: mouse-
+scroll/keyboard desync, boundary-scroll oscillation). It has zero
+knowledge of Terraform, plan data, or text rendering; `cmd/foldtree-demo`
+exercises it standalone against synthetic trees for exactly this reason.
+
+Every `Model` key handler that used to juggle a resource-index cursor and
+a separate fold-block cursor now just calls `nav.MoveUp()`/`MoveDown()`/
+`ToggleCollapse(id)`/`ExpandSubtree(id)`/etc. on whatever's currently
+selected — `ExpandSubtree`/`CollapseSubtree` already do the right thing
+whether that's a resource root or a deeply nested attribute, so the old
+"try block-level op, fall back to resource-level op" branching is gone.
+
+### 3. Flat render loop
+
+`render()`/`renderRow()` walk `nav.Rows()` once and dispatch each row, by
+its `rowInfo.kind`, to the same per-kind render helpers the old recursive
+walker used (`renderFoldHeader`, `renderLeafRow`,
+`renderMultilineStringBody`, …) — just called from a flat loop instead of
+a pointer-threaded recursion tracking a separate block-cursor index and
+running line count. `viewport.YOffset` is set from `nav.Offset()` after
+every mutation and never touched independently (mouse-wheel events are
+translated to `nav.MoveMouse(delta)`, never forwarded to
+`viewport.Update`).
+
+Every node's ID is `address + "#" + attribute.Path` (e.g.
+`aws_instance.web#tags`), with a deterministic suffix (`#close`, `#body`,
+`#eot`, `#noop`) for the synthetic nodes a container/multi-line
+string/no-op run adds — stable across rebuilds (resize, `diffContext`
+change, filter/sort/search) regardless of terminal width or search state,
+so `foldtree`'s ID-based selection-preservation keeps the right row
+selected even if the tree structure around it changes.
 
 ## Key Design Decisions
 
@@ -308,6 +365,16 @@ were line-offset-based and could drift.
    keeps `Resources`/`OutputChanges` as accurate, separate data while
    giving the TUI one unified, navigable list — and makes "plan has
    output-only changes" correctly count as "has changes."
+6. **Navigation is a separate, generic library, not TUI-specific state.**
+   `internal/foldtree` knows nothing about Terraform — only a tree of
+   nodes, collapse state, cursor position, and scroll offset, kept
+   together in one `State` so they can't drift apart. This replaced a
+   two-cursor design (a resource-index cursor plus a separate fold-block
+   cursor, kept in sync by hand across ~20 key handlers) that was the
+   root cause of several navigation bugs. Being generic and decoupled
+   means it's independently testable (adversarial structural tests, a
+   randomized invariant fuzzer) and independently usable
+   (`cmd/foldtree-demo`) without any plan data at all.
 
 ## Testing Strategy
 
@@ -323,3 +390,18 @@ parses/renders plan JSON, it doesn't provision anything:
 - `internal/runner` tests point `Options.Cmd` at a stand-in shell script
   instead of shimming `PATH`, since `Cmd` is just an executable path.
 - `internal/history` tests redirect `$HOME` to a `t.TempDir()`.
+- `internal/foldtree` is tested entirely standalone, with synthetic trees
+  it constructs itself — no plan data, no rendering, no Bubble Tea.
+  Coverage includes ordinary navigation, adversarial structural cases
+  (deep chains, wide fanout, zero/negative heights, duplicate IDs), a
+  randomized invariant fuzzer (many seeds × many random operation
+  sequences, asserting the cursor is always in range and always visible
+  after a move), and regression tests for specific bugs found against a
+  real-world plan (e.g. the boundary-scroll oscillation), generalized
+  into synthetic shapes rather than depending on that plan's data.
+- `internal/tui`'s `foldtree_adapter_test.go` checks the one property that
+  matters most at the integration boundary: a node's declared `Height`
+  always matches what its cached text actually renders as (including
+  width-driven wrapping, not just diff-context-driven line counts) —
+  the specific failure mode that would silently desync scroll position
+  from the screen if the adapter and the renderer ever drifted apart.
