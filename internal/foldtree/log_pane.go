@@ -7,7 +7,15 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/muesli/reflow/wordwrap"
+	"github.com/muesli/reflow/wrap"
 )
+
+// wrapMinWidth is the narrowest width LogPane will actually word-wrap at;
+// below it, wordwrap.String tends to produce a near-unreadable
+// one-character-per-line result, so lines are left as-is (relying on
+// horizontal scroll instead) rather than wrapped into garbage.
+const wrapMinWidth = 10
 
 // LogPane is an append-only, auto-scrolling text pane for showing a
 // running (or already-finished) process's output — e.g. `terraform plan`
@@ -15,18 +23,34 @@ import (
 // content arrives unless the user has manually scrolled up to inspect
 // history, exactly like a terminal's own scrollback/tail behavior.
 //
+// Lines can be word-wrapped to the pane's width ('w' toggles it, off by
+// default so raw output looks exactly like a real terminal until asked
+// otherwise); horizontal scroll (bubbles/viewport's own default keymap,
+// left/right or h/l) is how the unwrapped view — or any line wordwrap
+// can't shrink even when wrapping is on, like a single unbroken token
+// wider than the pane — gets inspected. An active search highlights
+// every occurrence of the query within the visible text, not just the
+// line it's on.
+//
 // LogPane is deliberately not built on Node/State: log lines are a flat,
 // ever-growing list, not a collapsible tree, so it wraps bubbles/viewport
 // directly instead of forcing an unrelated shape through the fold-tree
 // machinery. It does supply its own g/G (top/bottom) and "/"-search,
 // mirroring TreeView's own key vocabulary — bubbles/viewport's own
-// default keymap already covers j/k/u/d/pgup/pgdown.
+// default keymap already covers j/k/u/d/pgup/pgdown and left/right.
 type LogPane struct {
 	viewport viewport.Model
-	lines    []string
+	lines    []string // original, unwrapped lines -- what search matches against
 	visible  bool
 	ready    bool
 	pendingG bool
+
+	// wrappedLineStarts[i] is the row index within the viewport's
+	// displayed content where original line i begins -- needed to scroll
+	// a match into view correctly, since wrapping (when on) can turn one
+	// logical line into several displayed rows.
+	wrappedLineStarts []int
+	wordWrap          bool // off by default; toggled with 'w'
 
 	searching   bool
 	searchInput textinput.Model
@@ -37,6 +61,12 @@ type LogPane struct {
 
 var _ tea.Model = LogPane{}
 
+// horizontalScrollStep is how many columns left/right move per keypress.
+// bubbles/viewport disables horizontal scrolling by default (its own
+// horizontalStep is 0 unless set), which would otherwise make h/left and
+// l/right silent no-ops on any line wordwrap couldn't shrink to width.
+const horizontalScrollStep = 4
+
 // NewLogPane returns an empty, hidden LogPane. Call SetSize before it's
 // shown for the first time.
 func NewLogPane() *LogPane {
@@ -44,11 +74,13 @@ func NewLogPane() *LogPane {
 	ti.Placeholder = "Search..."
 	ti.CharLimit = 200
 	ti.Width = 40
-	return &LogPane{searchInput: ti}
+	p := &LogPane{searchInput: ti}
+	p.viewport.SetHorizontalStep(horizontalScrollStep)
+	return p
 }
 
 // SetSize resizes the underlying viewport, preserving whether it was
-// pinned to the bottom.
+// pinned to the bottom. A width change re-wraps existing content.
 func (p *LogPane) SetSize(width, height int) {
 	if width < 0 {
 		width = 0
@@ -57,9 +89,13 @@ func (p *LogPane) SetSize(width, height int) {
 		height = 0
 	}
 	wasAtBottom := !p.ready || p.viewport.AtBottom()
+	widthChanged := p.viewport.Width != width
 	p.viewport.Width = width
 	p.viewport.Height = height
 	p.ready = true
+	if widthChanged {
+		p.refreshContent()
+	}
 	if wasAtBottom {
 		p.viewport.GotoBottom()
 	}
@@ -71,9 +107,8 @@ func (p *LogPane) SetSize(width, height int) {
 // since it was matching a now-replaced document.
 func (p *LogPane) SetLines(lines []string) {
 	p.lines = append([]string(nil), lines...)
-	p.viewport.SetContent(strings.Join(p.lines, "\n"))
+	p.clearSearch() // also rebuilds wrapped content
 	p.viewport.GotoTop()
-	p.clearSearch()
 }
 
 // Append adds one streamed line. If the pane was already scrolled to the
@@ -84,7 +119,7 @@ func (p *LogPane) SetLines(lines []string) {
 func (p *LogPane) Append(line string) {
 	wasAtBottom := p.viewport.AtBottom()
 	p.lines = append(p.lines, line)
-	p.viewport.SetContent(strings.Join(p.lines, "\n"))
+	p.refreshContent()
 	if wasAtBottom {
 		p.viewport.GotoBottom()
 	}
@@ -94,9 +129,8 @@ func (p *LogPane) Append(line string) {
 // output starts arriving.
 func (p *LogPane) Reset() {
 	p.lines = nil
-	p.viewport.SetContent("")
+	p.clearSearch() // also rebuilds (now-empty) content
 	p.viewport.GotoTop()
-	p.clearSearch()
 }
 
 // SetVisible shows or hides the pane. View returns "" while hidden.
@@ -107,6 +141,17 @@ func (p *LogPane) Visible() bool { return p.visible }
 
 // Toggle flips visibility.
 func (p *LogPane) Toggle() { p.visible = !p.visible }
+
+// WordWrap reports whether lines are currently word-wrapped to the
+// pane's width (off by default).
+func (p LogPane) WordWrap() bool { return p.wordWrap }
+
+// ToggleWordWrap flips word-wrap on/off and re-renders content
+// accordingly.
+func (p *LogPane) ToggleWordWrap() {
+	p.wordWrap = !p.wordWrap
+	p.refreshContent()
+}
 
 // Width reports the pane's current content width.
 func (p LogPane) Width() int { return p.viewport.Width }
@@ -131,8 +176,8 @@ func (p LogPane) Init() tea.Cmd { return nil }
 // (bubbles/viewport.Update never resizes itself — Width/Height are plain
 // fields the host must set); tea.KeyMsg is handled by handleKey (g/G,
 // "/" search, n/N, else forwarded to the viewport's own default keymap
-// for j/k/u/d/pgup/pgdown); anything else (e.g. mouse wheel) forwards
-// straight to the viewport.
+// for j/k/u/d/pgup/pgdown/left/right); anything else (e.g. mouse wheel)
+// forwards straight to the viewport.
 func (p LogPane) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -156,6 +201,9 @@ func (p LogPane) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		p.searching = true
 		p.searchInput.Focus()
 		return p, textinput.Blink
+	case "w":
+		p.ToggleWordWrap()
+		return p, nil
 	case "n":
 		p.jumpToMatch(p.matchPos + 1)
 		return p, nil
@@ -195,6 +243,7 @@ func (p LogPane) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		p.searchInput, cmd = p.searchInput.Update(msg)
 		p.searchQuery = p.searchInput.Value()
 		p.recomputeMatches()
+		p.refreshContent() // re-highlight matches as the query changes
 		if len(p.matches) > 0 {
 			p.jumpToMatch(0)
 		}
@@ -219,15 +268,18 @@ func (p *LogPane) recomputeMatches() {
 	}
 }
 
-// jumpToMatch moves to match index pos (wrapping) and scrolls that line
-// into view at the top of the viewport.
+// jumpToMatch moves to match index pos (wrapping) and scrolls that
+// line's first wrapped row into view.
 func (p *LogPane) jumpToMatch(pos int) {
 	if len(p.matches) == 0 {
 		return
 	}
 	pos = ((pos % len(p.matches)) + len(p.matches)) % len(p.matches)
 	p.matchPos = pos
-	p.viewport.SetYOffset(p.matches[pos])
+	lineIdx := p.matches[pos]
+	if lineIdx >= 0 && lineIdx < len(p.wrappedLineStarts) {
+		p.viewport.SetYOffset(p.wrappedLineStarts[lineIdx])
+	}
 }
 
 func (p *LogPane) clearSearch() {
@@ -236,6 +288,76 @@ func (p *LogPane) clearSearch() {
 	p.searchInput.SetValue("")
 	p.matches = nil
 	p.matchPos = 0
+	p.refreshContent()
+}
+
+// refreshContent rebuilds the viewport's displayed content from lines:
+// each line has every occurrence of the active search query highlighted,
+// then — only when word-wrap is on — is word-wrapped to the pane's
+// current width. wrappedLineStarts is rebuilt alongside so match-jumping
+// lands on the right displayed row either way.
+func (p *LogPane) refreshContent() {
+	width := p.viewport.Width
+	p.wrappedLineStarts = make([]int, len(p.lines))
+	var wrapped []string
+	row := 0
+	for i, line := range p.lines {
+		p.wrappedLineStarts[i] = row
+		display := line
+		if p.searchQuery != "" {
+			display = highlightOccurrences(display, p.searchQuery)
+		}
+		if p.wordWrap {
+			display = wrapLine(display, width)
+		}
+		sub := strings.Split(display, "\n")
+		wrapped = append(wrapped, sub...)
+		row += len(sub)
+	}
+	p.viewport.SetContent(strings.Join(wrapped, "\n"))
+}
+
+// wrapLine wraps s to width, leaving it untouched below wrapMinWidth
+// (see its doc) or when there's no usable width yet. It soft-wraps at
+// word boundaries first (wordwrap), then hard-wraps whatever's left
+// (wrap) so a single token with no spaces — a long ARN or hash, say,
+// which wordwrap alone won't break — still never exceeds width. That
+// guarantee matters beyond cosmetics: bubbles/viewport enables
+// horizontal scrolling for the *entire* pane the moment any one line is
+// wider than its Width, so a single unbroken overlong line would
+// silently defeat word-wrap for every other line too.
+func wrapLine(s string, width int) string {
+	if width < wrapMinWidth {
+		return s
+	}
+	return wrap.String(wordwrap.String(s, width), width)
+}
+
+// highlightOccurrences wraps every case-insensitive occurrence of query
+// in line with matchHighlightStyle. Safe to call before word-wrapping:
+// wordwrap.String (like the rest of this codebase's diff rendering) is
+// ANSI-aware and won't split inside the escape sequences this adds.
+func highlightOccurrences(line, query string) string {
+	if query == "" {
+		return line
+	}
+	lower := strings.ToLower(line)
+	q := strings.ToLower(query)
+	var b strings.Builder
+	i := 0
+	for {
+		idx := strings.Index(lower[i:], q)
+		if idx < 0 {
+			b.WriteString(line[i:])
+			break
+		}
+		start := i + idx
+		end := start + len(query)
+		b.WriteString(line[i:start])
+		b.WriteString(matchHighlightStyle.Render(line[start:end]))
+		i = end
+	}
+	return b.String()
 }
 
 // ViewSearchBar renders the search input line (while typing) or the

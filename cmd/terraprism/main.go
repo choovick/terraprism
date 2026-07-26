@@ -797,7 +797,9 @@ CONTROLS:
     n/N         Next/previous match
     a           Apply (only in apply mode); a then y streams live output
     o           Toggle the plan/apply output pane (takes most of the
-                screen; has its own j/k/gg/G nav and / search while open)
+                screen; has its own j/k/gg/G nav, / search with match
+                highlighting, w to toggle word wrap (off by default),
+                and h/l or left/right to scroll sideways while open)
     q/Esc       Quit (disabled while a plan or apply is in progress)
 
 HISTORY:
@@ -855,7 +857,9 @@ CONTROLS IN TUI:
     a           Apply the plan
     y           Confirm apply (starts a live-streamed apply)
     o           Toggle the plan/apply output pane (takes most of the
-                screen; has its own j/k/gg/G nav and / search while open)
+                screen; has its own j/k/gg/G nav, / search with match
+                highlighting, w to toggle word wrap (off by default),
+                and h/l or left/right to scroll sideways while open)
     q/Esc       Cancel and quit (disabled while a plan or apply is running)
 
 EXAMPLES:

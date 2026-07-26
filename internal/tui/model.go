@@ -1505,7 +1505,11 @@ func (m Model) viewHelpFooter() string {
 	}
 
 	if m.outputPane.Visible() {
-		navHint := "j/k/gg/G: nav • /: search • n/N: cycle matches"
+		wrapState := "off"
+		if m.outputPane.WordWrap() {
+			wrapState = "on"
+		}
+		navHint := fmt.Sprintf("j/k/gg/G: nav • h/l: scroll sideways • /: search • n/N: cycle • w: wrap (%s)", wrapState)
 		switch {
 		case m.planning:
 			return "Running plan... quit disabled • " + navHint + " • o: hide"

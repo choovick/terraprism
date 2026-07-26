@@ -2,6 +2,7 @@ package foldtree
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -262,5 +263,158 @@ func TestLogPaneViewSearchBarStates(t *testing.T) {
 	bar := p.ViewSearchBar(nil)
 	if !strings.Contains(bar, "line 3") || !strings.Contains(bar, "1/1") {
 		t.Fatalf("expected an applied-query status line with a 1/1 match count, got %q", bar)
+	}
+}
+
+func TestLogPaneWordWrapIsOffByDefault(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(20, 5)
+	if p.WordWrap() {
+		t.Fatalf("expected word wrap to start disabled")
+	}
+	longLine := strings.Repeat("word ", 20) // ~100 chars of wrappable text, far past width 20
+	p.SetLines([]string{longLine})
+
+	if got := p.viewport.TotalLineCount(); got != 1 {
+		t.Fatalf("expected the long line to stay a single row while word wrap is off, got %d rows", got)
+	}
+}
+
+func TestLogPaneToggleWordWrap(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(20, 5)
+	longLine := strings.Repeat("word ", 20)
+	p.SetLines([]string{longLine})
+
+	sendLogPaneKey(p, "w")
+	if !p.WordWrap() {
+		t.Fatalf("expected 'w' to enable word wrap")
+	}
+	if got := p.viewport.TotalLineCount(); got <= 1 {
+		t.Fatalf("expected the long line to wrap into multiple displayed rows once enabled, got %d rows", got)
+	}
+
+	sendLogPaneKey(p, "w")
+	if p.WordWrap() {
+		t.Fatalf("expected a second 'w' to disable word wrap again")
+	}
+	if got := p.viewport.TotalLineCount(); got != 1 {
+		t.Fatalf("expected the long line back to a single row once disabled, got %d rows", got)
+	}
+}
+
+func TestLogPaneRewrapsOnWidthChangeWhenEnabled(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(100, 5)
+	p.ToggleWordWrap()
+	p.SetLines([]string{strings.Repeat("word ", 20)})
+	wideRowCount := p.viewport.TotalLineCount()
+
+	p.SetSize(20, 5)
+	narrowRowCount := p.viewport.TotalLineCount()
+
+	if narrowRowCount <= wideRowCount {
+		t.Fatalf("expected narrowing the pane to increase the wrapped row count: wide=%d narrow=%d", wideRowCount, narrowRowCount)
+	}
+}
+
+// ansiStrip removes ANSI escape codes, mirroring the same pattern used
+// elsewhere in this codebase's tests (internal/tui/model_render_test.go)
+// to compare rendered text regardless of whether color output is active
+// in the current environment.
+var ansiStripPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func ansiStrip(s string) string { return ansiStripPattern.ReplaceAllString(s, "") }
+
+func TestHighlightOccurrencesPreservesTextAndMarksEveryMatch(t *testing.T) {
+	line := "resource created: aws_instance.foo and aws_instance.bar"
+	out := highlightOccurrences(line, "aws_instance")
+
+	if ansiStrip(out) != line {
+		t.Fatalf("highlighting must not alter the visible text:\ngot  %q\nwant %q", ansiStrip(out), line)
+	}
+	if strings.Count(out, "aws_instance") < 2 {
+		t.Fatalf("expected both occurrences of the query still present as literal text, got %q", out)
+	}
+}
+
+func TestHighlightOccurrencesIsCaseInsensitiveAndNoOpForEmptyQuery(t *testing.T) {
+	if got := highlightOccurrences("Hello World", ""); got != "Hello World" {
+		t.Fatalf("empty query should be a no-op, got %q", got)
+	}
+	out := highlightOccurrences("Hello World", "WORLD")
+	if ansiStrip(out) != "Hello World" {
+		t.Fatalf("case-insensitive match should still preserve original casing, got %q", ansiStrip(out))
+	}
+}
+
+func TestLogPaneSearchHighlightsAppliedQueryInView(t *testing.T) {
+	p := newTestLogPane(20)
+	p.SetVisible(true)
+	sendLogPaneKey(p, "/")
+	for _, r := range "line 3" {
+		sendLogPaneKey(p, string(r))
+	}
+	// While typing, the match should already be highlighted (and visible,
+	// since typing also jumps to the first match).
+	if !strings.Contains(ansiStrip(p.View()), "line 3") {
+		t.Fatalf("expected the matching line visible while searching:\n%s", p.View())
+	}
+}
+
+func TestLogPaneHorizontalScrollRevealsUnwrappableToken(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(10, 3)
+	// A single token with no spaces can't be word-wrapped, so it stays as
+	// one line wider than the pane -- horizontal scroll (bubbles/
+	// viewport's own default "l"/"right" binding) is how the rest of it
+	// becomes visible.
+	token := "abcdefghijklmnopqrstuvwxyz0123456789"
+	p.SetLines([]string{token})
+	p.SetVisible(true)
+
+	initial := p.View()
+	if !strings.Contains(initial, "abcdefghij") {
+		t.Fatalf("expected the start of the unbroken token visible initially, got %q", initial)
+	}
+	if strings.Contains(initial, "0123456789") {
+		t.Fatalf("expected the tail of the token clipped off-screen initially, got %q", initial)
+	}
+
+	for i := 0; i < 30; i++ {
+		sendLogPaneKey(p, "l")
+	}
+	scrolled := p.View()
+	if !strings.Contains(scrolled, "0123456789") {
+		t.Fatalf("expected 'l' (horizontal scroll) to eventually reveal the rest of the token, got %q", scrolled)
+	}
+}
+
+// Regression: bubbles/viewport enables horizontal-scroll cropping for the
+// *whole* pane the instant any single line exceeds its Width -- so if
+// word wrap only soft-wrapped at spaces (wordwrap alone), one unbreakable
+// token (a long ARN, a hash, ...) would silently force every other,
+// already-short line into cropped/scrollable mode too. wrapLine chains a
+// hard-wrap pass specifically to prevent that.
+func TestLogPaneWordWrapHardBreaksUnwrappableTokensSoNoHorizontalScrollIsNeeded(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(10, 5)
+	p.ToggleWordWrap()
+	token := "abcdefghijklmnopqrstuvwxyz0123456789"
+	p.SetLines([]string{token})
+	p.SetVisible(true)
+
+	view := p.View()
+	for _, chunk := range []string{"abcdefghij", "klmnopqrst", "uvwxyz0123", "456789"} {
+		if !strings.Contains(view, chunk) {
+			t.Fatalf("expected hard-wrapped chunk %q visible without any horizontal scroll:\n%q", chunk, view)
+		}
+	}
+
+	for i := 0; i < 10; i++ {
+		sendLogPaneKey(p, "l")
+	}
+	if got := p.View(); got != view {
+		t.Fatalf("expected horizontal scroll to be a no-op once word wrap guarantees every line fits:\nbefore %q\nafter  %q", view, got)
 	}
 }
