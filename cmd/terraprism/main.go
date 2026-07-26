@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -181,42 +180,20 @@ func runApplyMode(args []string, isDestroy bool) {
 		tfArgs = ensureDestroyFlag(tfArgs)
 	}
 
-	ctx := context.Background()
-
-	fmt.Printf("Terra-Prism: Running %s plan... ", tfCmd)
-	result, err := runner.RunPlan(ctx, runner.Options{
+	// Plan runs *inside* the TUI itself (tui.Model.startPlanCmd, via
+	// runner.PlanStream), streaming its output live into the output pane
+	// -- the TUI launches immediately with an empty tree that gets
+	// populated once planning completes, rather than main.go running
+	// plan synchronously beforehand. Apply, once confirmed, streams the
+	// same way (runner.ApplyStream). By the time p.Run() returns, both
+	// are guaranteed finished (quitting is blocked mid-run), which is
+	// what keeps the plan-file cleanup below safe.
+	opts := runner.Options{
 		Cmd:          runner.TFCommand(tfCmd),
 		Args:         tfArgs,
 		KeepPlanFile: true,
-	})
-	if err != nil {
-		fmt.Println("FAILED")
-		reportRunError(tfCmd, err)
-		os.Exit(1)
 	}
-	planFile := result.PlanFile
-	defer os.Remove(planFile)
-	fmt.Println("OK")
-
-	historyPath := saveHistory(commandName, tfCmd, tfArgs, result.RawJSON)
-
-	plan := result.Plan
-	if len(plan.DisplayResources()) == 0 {
-		fmt.Println("No changes. Infrastructure is up-to-date.")
-		if historyPath != "" {
-			_, _ = history.UpdateFilenameWithStatus(historyPath, "nochanges")
-		}
-		os.Exit(0)
-	}
-
-	// Apply itself now runs *inside* the TUI (tui.Model.startApplyCmd,
-	// via runner.ApplyStream) once the user confirms, rather than after
-	// the program exits: the TUI stays up and renders live progress in
-	// its output pane, and blocks quitting until the subprocess is done.
-	// By the time p.Run() returns, any apply that was started is
-	// guaranteed finished -- which is also what keeps the deferred
-	// os.Remove(planFile) above safe.
-	model := tui.NewModelWithApply(plan, planFile, tfCmd, version, string(result.Output))
+	model := tui.NewModelPlanning(opts, version, true)
 	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := p.Run()
 	if err != nil {
@@ -225,9 +202,29 @@ func runApplyMode(args []string, isDestroy bool) {
 	}
 
 	m, ok := finalModel.(tui.Model)
+	if !ok {
+		return // unreachable: finalModel is always the tui.Model this function built
+	}
+	if planFile := m.PlanFile(); planFile != "" {
+		defer os.Remove(planFile)
+	}
+
+	if err := m.PlanErr(); err != nil {
+		reportRunError(tfCmd, err)
+		os.Exit(1)
+	}
+
+	historyPath := saveHistory(commandName, tfCmd, tfArgs, m.PlanRawJSON())
+
+	if len(m.Plan().DisplayResources()) == 0 {
+		fmt.Println("No changes. Infrastructure is up-to-date.")
+		if historyPath != "" {
+			_, _ = history.UpdateFilenameWithStatus(historyPath, "nochanges")
+		}
+		return
+	}
+
 	switch {
-	case !ok:
-		// Unreachable: finalModel is always the tui.Model this function built.
 	case !m.ApplyAttempted():
 		fmt.Println("\nApply cancelled.")
 		if historyPath != "" {
@@ -272,39 +269,32 @@ func runPlanMode(args []string) {
 	}
 
 	tfCmd := detectTFCommand()
+	opts := runner.Options{Cmd: runner.TFCommand(tfCmd), Args: tfArgs}
 
-	fmt.Printf("Terra-Prism: Running %s plan... ", tfCmd)
-
-	result, err := runner.RunPlan(context.Background(), runner.Options{
-		Cmd:  runner.TFCommand(tfCmd),
-		Args: tfArgs,
-	})
+	// Plan streams live into the TUI's output pane -- see runApplyMode's
+	// comment for why the TUI launches before plan has even started.
+	model := tui.NewModelPlanning(opts, version, false)
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	finalModel, err := p.Run()
 	if err != nil {
-		fmt.Println("FAILED")
+		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)
+		os.Exit(1)
+	}
+
+	m, ok := finalModel.(tui.Model)
+	if !ok {
+		return // unreachable: finalModel is always the tui.Model this function built
+	}
+
+	if err := m.PlanErr(); err != nil {
 		reportRunError(tfCmd, err)
 		os.Exit(1)
 	}
 
-	fmt.Println("OK")
+	saveHistory("plan", tfCmd, tfArgs, m.PlanRawJSON())
 
-	saveHistory("plan", tfCmd, tfArgs, result.RawJSON)
-
-	plan := result.Plan
-	if len(plan.DisplayResources()) == 0 {
+	if len(m.Plan().DisplayResources()) == 0 {
 		fmt.Println("No changes. Infrastructure is up-to-date.")
-		os.Exit(0)
-	}
-
-	// Go straight to TUI
-	p := tea.NewProgram(
-		tui.NewModel(plan, version),
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
-	)
-
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)
-		os.Exit(1)
 	}
 }
 
@@ -806,8 +796,8 @@ CONTROLS:
     /           Search resources
     n/N         Next/previous match
     a           Apply (only in apply mode); a then y streams live output
-    o           Toggle the plan/apply output pane (apply mode only)
-    q/Esc       Quit (disabled while an apply is in progress)
+    o           Toggle the plan/apply output pane
+    q/Esc       Quit (disabled while a plan or apply is in progress)
 
 HISTORY:
     All plan and apply outputs are saved to ~/.terraprism/
@@ -845,10 +835,11 @@ USAGE:
     terraprism apply [-- terraform-args]
 
 DESCRIPTION:
-    Runs terraform/tofu plan, displays in interactive TUI for review, then
-    applies if you press 'a' then 'y'. Apply runs inside the TUI itself,
-    streaming its output live into a toggleable pane ('o') rather than
-    exiting to the plain terminal first.
+    Launches the TUI immediately and runs terraform/tofu plan inside it,
+    streaming live output into a toggleable pane ('o') while the tree
+    populates. Once you review the plan, press 'a' then 'y' to apply --
+    apply streams into the same pane. Neither step exits to the plain
+    terminal first.
 
     All output is saved to ~/.terraprism/ for history.
 
@@ -863,7 +854,7 @@ CONTROLS IN TUI:
     a           Apply the plan
     y           Confirm apply (starts a live-streamed apply)
     o           Toggle the plan/apply output pane
-    q/Esc       Cancel and quit (disabled while an apply is running)
+    q/Esc       Cancel and quit (disabled while a plan or apply is running)
 
 EXAMPLES:
     terraprism apply

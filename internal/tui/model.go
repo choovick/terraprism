@@ -29,6 +29,16 @@ type Model struct {
 	width           int
 	height          int
 
+	// Plan-streaming fields: when planning is true, the model starts with
+	// an empty plan and Init() kicks off runner.PlanStream itself,
+	// populating the real plan and hiding the output pane once it lands.
+	planOptions runner.Options
+	planning    bool
+	planRawJSON []byte
+	planErr     error
+	planLines   <-chan runner.PlanLine
+	planDone    <-chan runner.PlanStreamResult
+
 	// Apply mode fields
 	applyMode      bool   // Whether apply is available
 	planFile       string // Path to the plan file
@@ -210,6 +220,24 @@ func NewModelWithApply(plan *tfplan.Plan, planFile, tfCommand, version, planOutp
 	return m
 }
 
+// NewModelPlanning creates a TUI model that starts with an empty plan
+// and runs runner.PlanStream itself (kicked off from Init()), streaming
+// `plan`'s output live into the output pane instead of the caller
+// running it synchronously beforehand. Once planning completes
+// successfully, the real plan replaces the empty one, the tree is built,
+// and the output pane hides itself again (still reachable via 'o').
+// applyMode controls whether 'a'/'y' are active once planning finishes,
+// exactly as with NewModel vs NewModelWithApply.
+func NewModelPlanning(opts runner.Options, version string, applyMode bool) Model {
+	m := newModel(&tfplan.Plan{}, version, "")
+	m.applyMode = applyMode
+	m.tfCommand = string(opts.Cmd)
+	m.planOptions = opts
+	m.planning = true
+	m.outputPane.SetVisible(true)
+	return m
+}
+
 // withDisplayResources returns a Plan whose Resources includes output
 // changes as synthetic entries (see tfplan.Plan.DisplayResources), so the
 // rest of the model's rendering/navigation/filtering/sorting code — which
@@ -239,12 +267,41 @@ func (m Model) ApplyResult() error {
 	return m.applyResult
 }
 
+// Plan returns the current plan -- for a Model built via NewModelPlanning,
+// only meaningful once the program has exited and PlanErr() is nil.
+func (m Model) Plan() *tfplan.Plan {
+	return m.plan
+}
+
+// PlanFile returns the on-disk path of the binary plan file produced by
+// a NewModelPlanning run (empty if planning hasn't completed, failed, or
+// KeepPlanFile wasn't set).
+func (m Model) PlanFile() string {
+	return m.planFile
+}
+
+// PlanRawJSON returns the raw `show -json` bytes decoded during a
+// NewModelPlanning run (nil if planning hasn't completed or failed).
+func (m Model) PlanRawJSON() []byte {
+	return m.planRawJSON
+}
+
+// PlanErr reports why a NewModelPlanning run's plan step failed, or nil
+// if it hasn't been attempted, is still running, or succeeded.
+func (m Model) PlanErr() error {
+	return m.planErr
+}
+
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
-	if m.currentVersion == "" || updater.IsSkipUpdateCheck() {
-		return nil
+	var cmds []tea.Cmd
+	if m.currentVersion != "" && !updater.IsSkipUpdateCheck() {
+		cmds = append(cmds, checkUpdateCmd(m.currentVersion))
 	}
-	return checkUpdateCmd(m.currentVersion)
+	if m.planning {
+		cmds = append(cmds, m.startPlanCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 // checkUpdateCmd runs an async update check and sends UpdateAvailableMsg if an update is available.
@@ -356,6 +413,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applying = false
 		m.applyResult = msg.err
 		return m, nil
+
+	case planStreamStartedMsg:
+		m.planLines = msg.lines
+		m.planDone = msg.done
+		return m, waitForPlanEvent(msg.lines, msg.done)
+
+	case planLineMsg:
+		m.outputPane.Append(msg.Text)
+		return m, waitForPlanEvent(m.planLines, m.planDone)
+
+	case planDoneMsg:
+		m.planning = false
+		if msg.err != nil {
+			m.planErr = msg.err
+			return m, nil
+		}
+		m.plan = withDisplayResources(msg.result.Plan)
+		m.planFile = msg.result.PlanFile
+		m.planRawJSON = msg.result.RawJSON
+		m.planOutput = string(msg.result.Output)
+		m.outputPane.SetLines(strings.Split(m.planOutput, "\n"))
+		m.outputPane.SetVisible(false)
+		m.rebuildTree()
+		m.reflow()
+		return m, nil
 	}
 
 	return m, nil
@@ -402,12 +484,13 @@ var tuiKeyHandlers = map[string]normalKeyHandler{
 	"y":      handleKeyConfirmApply,
 }
 
-// handleKeyQuit quits, unless an apply is currently running -- letting
-// the program exit mid-apply would race main.go's plan-file cleanup
-// against the still-running subprocess and orphan it, since nothing
-// left running after the TUI exits could still cancel it.
+// handleKeyQuit quits, unless a plan or apply subprocess is currently
+// running -- letting the program exit mid-run would race main.go's
+// plan-file handling against the still-running subprocess and orphan
+// it, since nothing left running after the TUI exits could still cancel
+// it.
 func handleKeyQuit(m Model) (Model, tea.Cmd, bool) {
-	if m.applying {
+	if m.applying || m.planning {
 		return m, nil, true
 	}
 	return m, tea.Quit, true
@@ -426,12 +509,18 @@ func handleKeyToggleOutput(m Model) (Model, tea.Cmd, bool) {
 }
 
 func handleKeyFilter(m Model) (Model, tea.Cmd, bool) {
+	if m.planning {
+		return m, nil, true
+	}
 	m.filtering = true
 	m.filterPicker.SetCursor(0)
 	return m, nil, true
 }
 
 func handleKeySort(m Model) (Model, tea.Cmd, bool) {
+	if m.planning {
+		return m, nil, true
+	}
 	m.sorting = true
 	m.sortPicker.SetCurrent(m.sortPicker.Current()) // reseed cursor to match today's active order
 	return m, nil, true
@@ -463,7 +552,7 @@ func handleKeyDecreaseDiffContext(m Model) (Model, tea.Cmd, bool) {
 }
 
 func handleKeyApply(m Model) (Model, tea.Cmd, bool) {
-	if m.applyMode {
+	if m.applyMode && !m.planning {
 		if m.confirmApply {
 			return m.startApply()
 		}
@@ -473,7 +562,7 @@ func handleKeyApply(m Model) (Model, tea.Cmd, bool) {
 }
 
 func handleKeyConfirmApply(m Model) (Model, tea.Cmd, bool) {
-	if m.applyMode && m.confirmApply {
+	if m.applyMode && m.confirmApply && !m.planning {
 		return m.startApply()
 	}
 	return m, nil, true
@@ -520,6 +609,43 @@ func waitForApplyEvent(lines <-chan runner.ApplyLine, done <-chan error) tea.Cmd
 			return applyLineMsg(line)
 		}
 		return applyDoneMsg{err: <-done}
+	}
+}
+
+// planStreamStartedMsg carries the channels PlanStream returns, once the
+// plan subprocess has actually started.
+type planStreamStartedMsg struct {
+	lines <-chan runner.PlanLine
+	done  <-chan runner.PlanStreamResult
+}
+
+// planLineMsg is one streamed line of `plan` output.
+type planLineMsg runner.PlanLine
+
+// planDoneMsg reports the plan subprocess's final result: either a
+// ready-to-display plan, or the error explaining why there isn't one.
+type planDoneMsg struct {
+	result *runner.PlanResult
+	err    error
+}
+
+func (m Model) startPlanCmd() tea.Cmd {
+	opts := m.planOptions
+	return func() tea.Msg {
+		lines, done := runner.PlanStream(context.Background(), opts)
+		return planStreamStartedMsg{lines: lines, done: done}
+	}
+}
+
+// waitForPlanEvent mirrors waitForApplyEvent, one message at a time, for
+// as long as planning runs.
+func waitForPlanEvent(lines <-chan runner.PlanLine, done <-chan runner.PlanStreamResult) tea.Cmd {
+	return func() tea.Msg {
+		if line, ok := <-lines; ok {
+			return planLineMsg(line)
+		}
+		res := <-done
+		return planDoneMsg{result: res.Result, err: res.Err}
 	}
 }
 
@@ -1311,6 +1437,22 @@ func (m Model) viewSortStatus() string {
 // still running -- mutually exclusive with each other and with the
 // pre-confirmation prompt.
 func (m Model) viewConfirmationPrompt() string {
+	if m.planning {
+		style := lipgloss.NewStyle().
+			Background(updateColor).
+			Foreground(textColor).
+			Bold(true).
+			Padding(0, 2)
+		return "\n" + style.Render("⏳ Running plan... quit is disabled until it finishes") + "\n\n"
+	}
+	if m.planErr != nil {
+		style := lipgloss.NewStyle().
+			Background(destroyColor).
+			Foreground(textColor).
+			Bold(true).
+			Padding(0, 2)
+		return "\n" + style.Render(fmt.Sprintf("✗ Plan failed: %v", m.planErr)) + "\n\n"
+	}
 	if m.applying {
 		style := lipgloss.NewStyle().
 			Background(updateColor).
@@ -1335,6 +1477,14 @@ func (m Model) viewHelpFooter() string {
 	maxWidth := m.width - 4
 	if maxWidth <= 0 {
 		maxWidth = m.treeView.Width()
+	}
+
+	if m.planning {
+		return "Running plan... quit disabled until it finishes • o: toggle output"
+	}
+
+	if m.planErr != nil {
+		return "Plan failed • o: toggle output • q: quit"
 	}
 
 	if m.applying {

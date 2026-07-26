@@ -5,6 +5,7 @@ package runner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -77,46 +78,127 @@ func (e *ShowError) Unwrap() error { return e.Err }
 // `<cmd> show -json <tmpfile>` and decodes the result via tfplan.Decode.
 // A binary plan file is always written, since `show -json` requires one
 // — there is no way to obtain JSON plan output without it.
+//
+// RunPlan is a thin synchronous wrapper over PlanStream (draining its
+// line channel without exposing it), so a caller that doesn't need live
+// progress gets identical behavior/output to one that does, by
+// construction rather than by keeping two implementations in sync.
 func RunPlan(ctx context.Context, opts Options) (*PlanResult, error) {
-	planFile := filepath.Join(os.TempDir(), fmt.Sprintf("terraprism-%d.tfplan", os.Getpid()))
+	lines, done := PlanStream(ctx, opts)
+	for range lines {
+	}
+	res := <-done
+	return res.Result, res.Err
+}
 
+// PlanLine is one line of streamed `plan` output.
+type PlanLine struct {
+	Text string
+}
+
+// PlanStreamResult is what PlanStream eventually delivers on its done
+// channel: either a populated Result, or Err (a *PlanError, *ShowError,
+// or plain decode error — see RunPlan's doc for what each means).
+type PlanStreamResult struct {
+	Result *PlanResult
+	Err    error
+}
+
+// PlanStream starts `<cmd> plan -out=<tmpfile> -no-color <args...>`,
+// merging stdout and stderr into a single ordered stream of lines the
+// same way ApplyStream does, and returns immediately once the
+// subprocess has started. Lines arrive on the returned channel as
+// they're produced; lines is always fully drained and closed before
+// exactly one PlanStreamResult is sent on done, after which done is
+// closed too.
+//
+// If `plan` itself succeeds, PlanStream goes on to run `<cmd> show
+// -json` (fast and not itself streamed — it's a single JSON blob, not
+// line-oriented progress) and decode it before signaling done, so a
+// successful PlanStreamResult always carries a fully-decoded Plan ready
+// to display; a caller never sees "done" without either a usable Plan or
+// an error explaining why not.
+func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan PlanStreamResult) {
+	lines := make(chan PlanLine, 64)
+	done := make(chan PlanStreamResult, 1)
+
+	planFile := filepath.Join(os.TempDir(), fmt.Sprintf("terraprism-%d.tfplan", os.Getpid()))
 	planArgs := append([]string{"plan", "-out=" + planFile, "-no-color"}, opts.Args...)
 	planCmd := exec.CommandContext(ctx, string(opts.Cmd), planArgs...)
 	planCmd.Dir = opts.Dir
-	output, err := planCmd.CombinedOutput()
-	if err != nil {
-		os.Remove(planFile)
-		return nil, &PlanError{Cmd: opts.Cmd, Output: output, Err: err}
+
+	pr, pw := io.Pipe()
+	planCmd.Stdout = pw
+	planCmd.Stderr = pw
+
+	if err := planCmd.Start(); err != nil {
+		pw.Close()
+		close(lines)
+		done <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Err: err}}
+		close(done)
+		return lines, done
 	}
 
-	showCmd := exec.CommandContext(ctx, string(opts.Cmd), "show", "-json", planFile)
-	showCmd.Dir = opts.Dir
-	jsonBytes, err := showCmd.Output()
-	if err != nil {
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- planCmd.Wait()
+		pw.Close()
+	}()
+
+	go func() {
+		var output bytes.Buffer
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			text := scanner.Text()
+			output.WriteString(text)
+			output.WriteByte('\n')
+			lines <- PlanLine{Text: text}
+		}
+		close(lines)
+
+		if err := <-waitErr; err != nil {
+			os.Remove(planFile)
+			done <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Output: output.Bytes(), Err: err}}
+			close(done)
+			return
+		}
+
+		showCmd := exec.CommandContext(ctx, string(opts.Cmd), "show", "-json", planFile)
+		showCmd.Dir = opts.Dir
+		jsonBytes, err := showCmd.Output()
+		if err != nil {
+			if !opts.KeepPlanFile {
+				os.Remove(planFile)
+			}
+			var stderr []byte
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				stderr = exitErr.Stderr
+			}
+			done <- PlanStreamResult{Err: &ShowError{Cmd: opts.Cmd, Stderr: stderr, Err: err}}
+			close(done)
+			return
+		}
+
+		plan, err := tfplan.DecodeBytes(jsonBytes)
+		if err != nil {
+			if !opts.KeepPlanFile {
+				os.Remove(planFile)
+			}
+			done <- PlanStreamResult{Err: fmt.Errorf("decoding plan JSON: %w", err)}
+			close(done)
+			return
+		}
+
+		result := &PlanResult{Plan: plan, RawJSON: jsonBytes, PlanFile: planFile, Output: output.Bytes()}
 		if !opts.KeepPlanFile {
 			os.Remove(planFile)
+			result.PlanFile = ""
 		}
-		var stderr []byte
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr = exitErr.Stderr
-		}
-		return nil, &ShowError{Cmd: opts.Cmd, Stderr: stderr, Err: err}
-	}
+		done <- PlanStreamResult{Result: result}
+		close(done)
+	}()
 
-	plan, err := tfplan.DecodeBytes(jsonBytes)
-	if err != nil {
-		if !opts.KeepPlanFile {
-			os.Remove(planFile)
-		}
-		return nil, fmt.Errorf("decoding plan JSON: %w", err)
-	}
-
-	result := &PlanResult{Plan: plan, RawJSON: jsonBytes, PlanFile: planFile, Output: output}
-	if !opts.KeepPlanFile {
-		os.Remove(planFile)
-		result.PlanFile = ""
-	}
-	return result, nil
+	return lines, done
 }
 
 // ApplyLine is one line of streamed `apply` output.

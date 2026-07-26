@@ -21,6 +21,15 @@ case "$1" in
       echo "fake-plan-binary" > "$outfile"
     fi
     printf '%s' "$FAKE_TF_PLAN_STDOUT"
+    if [ -n "$FAKE_TF_PLAN_LINES" ]; then
+      old_ifs="$IFS"
+      IFS='|'
+      for line in $FAKE_TF_PLAN_LINES; do
+        echo "$line"
+        sleep 0.01
+      done
+      IFS="$old_ifs"
+    fi
     exit "${FAKE_TF_PLAN_EXIT:-0}"
     ;;
   show)
@@ -139,6 +148,86 @@ func TestRunPlanInvalidJSON(t *testing.T) {
 	_, err := RunPlan(context.Background(), Options{Cmd: TFCommand(fake)})
 	if err == nil {
 		t.Fatalf("expected decode error")
+	}
+}
+
+func TestPlanStreamDeliversLinesThenSucceeds(t *testing.T) {
+	t.Setenv("FAKE_TF_PLAN_LINES", "reading state...|refreshing...|plan generated")
+	t.Setenv("FAKE_TF_SHOW_STDOUT", validPlanJSON)
+	fake := writeFakeTF(t)
+
+	lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake)})
+
+	var got []string
+	for l := range lines {
+		got = append(got, l.Text)
+	}
+	want := []string{"reading state...", "refreshing...", "plan generated"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines, want %d: %v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("line %d = %q, want %q", i, got[i], w)
+		}
+	}
+
+	res := <-done
+	if res.Err != nil {
+		t.Fatalf("unexpected error: %v", res.Err)
+	}
+	if res.Result == nil || res.Result.Plan == nil || len(res.Result.Plan.Resources) != 1 {
+		t.Fatalf("expected a fully decoded plan, got %+v", res.Result)
+	}
+	wantOutput := "reading state...\nrefreshing...\nplan generated\n"
+	if string(res.Result.Output) != wantOutput {
+		t.Errorf("Output = %q, want %q", res.Result.Output, wantOutput)
+	}
+	if res.Result.PlanFile != "" {
+		t.Errorf("PlanFile should be empty when KeepPlanFile is false, got %q", res.Result.PlanFile)
+	}
+}
+
+func TestPlanStreamSurfacesPlanFailure(t *testing.T) {
+	t.Setenv("FAKE_TF_PLAN_LINES", "reading state...|Error: something went wrong")
+	t.Setenv("FAKE_TF_PLAN_EXIT", "1")
+	fake := writeFakeTF(t)
+
+	lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake)})
+	for range lines {
+	}
+	res := <-done
+
+	if res.Result != nil {
+		t.Fatalf("expected nil Result on plan failure, got %+v", res.Result)
+	}
+	var planErr *PlanError
+	if !errors.As(res.Err, &planErr) {
+		t.Fatalf("expected *PlanError, got %T: %v", res.Err, res.Err)
+	}
+	wantOutput := "reading state...\nError: something went wrong\n"
+	if string(planErr.Output) != wantOutput {
+		t.Errorf("PlanError.Output = %q, want %q", planErr.Output, wantOutput)
+	}
+}
+
+func TestPlanStreamKeepsPlanFileOnSuccess(t *testing.T) {
+	t.Setenv("FAKE_TF_SHOW_STDOUT", validPlanJSON)
+	fake := writeFakeTF(t)
+
+	lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake), KeepPlanFile: true})
+	for range lines {
+	}
+	res := <-done
+	if res.Err != nil {
+		t.Fatalf("unexpected error: %v", res.Err)
+	}
+	if res.Result.PlanFile == "" {
+		t.Fatalf("expected PlanFile to be set when KeepPlanFile is true")
+	}
+	defer os.Remove(res.Result.PlanFile)
+	if _, err := os.Stat(res.Result.PlanFile); err != nil {
+		t.Errorf("plan file should exist on disk: %v", err)
 	}
 }
 
