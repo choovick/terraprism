@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 
 	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
@@ -104,6 +103,24 @@ type PlanStreamResult struct {
 	Err    error
 }
 
+// reserveTempPlanFile creates and immediately closes a uniquely-named
+// temp file, returning its path for `plan -out=` to write into. Using
+// os.CreateTemp's atomic O_EXCL creation (rather than a name derived
+// only from os.Getpid, which the OS can reuse across processes) rules
+// out a stale leftover from a killed/crashed process ever colliding
+// with a later run.
+func reserveTempPlanFile() (string, error) {
+	f, err := os.CreateTemp("", "terraprism-*.tfplan")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 // PlanStream starts `<cmd> plan -out=<tmpfile> -no-color <args...>`,
 // merging stdout and stderr into a single ordered stream of lines the
 // same way ApplyStream does, and returns immediately once the
@@ -122,7 +139,13 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 	lines := make(chan PlanLine, 64)
 	done := make(chan PlanStreamResult, 1)
 
-	planFile := filepath.Join(os.TempDir(), fmt.Sprintf("terraprism-%d.tfplan", os.Getpid()))
+	planFile, err := reserveTempPlanFile()
+	if err != nil {
+		close(lines)
+		done <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Err: fmt.Errorf("creating temp plan file: %w", err)}}
+		close(done)
+		return lines, done
+	}
 	planArgs := append([]string{"plan", "-out=" + planFile, "-no-color"}, opts.Args...)
 	planCmd := exec.CommandContext(ctx, string(opts.Cmd), planArgs...)
 	planCmd.Dir = opts.Dir
