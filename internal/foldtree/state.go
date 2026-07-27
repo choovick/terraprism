@@ -67,8 +67,14 @@ func (s *State) SetExtraPadding(n int) {
 	s.clampOffset()
 }
 
-// IsCollapsed reports whether the node with the given ID is currently
-// collapsed. Always false for a node with Collapsible == false.
+// IsCollapsed reports whether the node with the given ID has been
+// marked collapsed via SetCollapsed/ToggleCollapse/CollapseAll. State
+// doesn't track which IDs belong to collapsible nodes, so this can
+// report true for a non-collapsible node's ID if a caller collapses it
+// directly -- that's harmless in practice, since Flatten independently
+// checks the node's own Collapsible field before ever consulting this,
+// so a non-collapsible node's children are never actually hidden
+// regardless of what this method reports for it.
 func (s *State) IsCollapsed(id string) bool {
 	return s.collapsed[id]
 }
