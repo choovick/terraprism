@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 const fakeTFScript = `#!/bin/sh
@@ -254,6 +256,46 @@ func TestApplyStreamDeliversLinesInOrderThenDoneOnSuccess(t *testing.T) {
 	// lines must be fully drained and closed before done fires.
 	if err := <-done; err != nil {
 		t.Errorf("expected nil error on success, got %v", err)
+	}
+}
+
+// Regression test: bufio.Scanner's default 64KB token limit would make
+// Scan stop permanently on a longer line, which stops draining the
+// pipe -- and since quitting is disabled for the duration of an apply,
+// that would hang the whole TUI with no way out. A bounded goroutine
+// read against a timeout turns "hangs forever" into a clean test
+// failure instead of stalling CI.
+func TestApplyStreamHandlesLineLongerThanDefaultScannerLimit(t *testing.T) {
+	longLine := strings.Repeat("x", 100_000) // well over bufio.MaxScanTokenSize (64KB)
+	t.Setenv("FAKE_TF_APPLY_LINES", longLine+"|apply complete!")
+	fake := writeFakeTF(t)
+
+	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+
+	type result struct {
+		got []string
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		var got []string
+		for l := range lines {
+			got = append(got, l.Text)
+		}
+		resultCh <- result{got: got, err: <-done}
+	}()
+
+	select {
+	case r := <-resultCh:
+		if len(r.got) != 2 || r.got[0] != longLine || r.got[1] != "apply complete!" {
+			t.Fatalf("got %d lines (want 2); first line length %d (want %d), second line %q",
+				len(r.got), len(r.got[0]), len(longLine), r.got[len(r.got)-1])
+		}
+		if r.err != nil {
+			t.Errorf("expected nil error on success, got %v", r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ApplyStream did not complete within 5s -- likely hung on a line exceeding the scanner buffer")
 	}
 }
 

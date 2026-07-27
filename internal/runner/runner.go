@@ -15,6 +15,26 @@ import (
 	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
 
+// maxScannerLineSize raises bufio.Scanner's default 64KB token limit.
+// terraform/tofu output is normally line-oriented and short, but a
+// single diagnostic line (e.g. a provider panic dump or an embedded
+// JSON error payload) can exceed that default -- and unlike a normal
+// io.Reader, exceeding it here doesn't just drop or truncate the line:
+// Scan stops permanently, so the loop stops draining the pipe, which
+// blocks the exec-internal goroutine copying the subprocess's real
+// stdout/stderr into it, which eventually blocks the subprocess's own
+// write syscall. Since quitting is disabled for the duration of a
+// plan/apply, that would hang the whole TUI with no way out.
+const maxScannerLineSize = 10 * 1024 * 1024
+
+// newOutputScanner returns a line scanner over r configured with
+// maxScannerLineSize, shared by PlanStream and ApplyStream.
+func newOutputScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxScannerLineSize)
+	return scanner
+}
+
 // TFCommand is the executable to invoke: "terraform", "tofu", or (in
 // tests) an absolute path to a stand-in script.
 type TFCommand string
@@ -170,7 +190,7 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 
 	go func() {
 		var output bytes.Buffer
-		scanner := bufio.NewScanner(pr)
+		scanner := newOutputScanner(pr)
 		for scanner.Scan() {
 			text := scanner.Text()
 			output.WriteString(text)
@@ -271,7 +291,7 @@ func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan Ap
 	}()
 
 	go func() {
-		scanner := bufio.NewScanner(pr)
+		scanner := newOutputScanner(pr)
 		for scanner.Scan() {
 			lines <- ApplyLine{Text: scanner.Text()}
 		}
