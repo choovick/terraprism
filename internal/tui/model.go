@@ -1039,6 +1039,13 @@ func isMultilineStringAttr(attr tfplan.Attribute) bool {
 // like any other collapsible block. Unlike the old heredoc-marker text
 // scanning this replaces, there's no marker detection needed at all:
 // JSON strings are just strings.
+//
+// The returned string has no trailing newline, matching every other
+// row-text producer and the RowRenderer.RenderRow contract TreeView
+// relies on (it appends exactly one "\n" per row itself) -- each branch
+// below writes one line at a time terminated by "\n" for simplicity, so
+// the trailing one is trimmed once at the end rather than restructuring
+// every branch to join instead of terminate.
 func (m Model) renderMultilineStringBody(attr tfplan.Attribute, indent string, maxWidth int) string {
 	var b strings.Builder
 	contentIndent := indent + "  "
@@ -1046,13 +1053,11 @@ func (m Model) renderMultilineStringBody(attr tfplan.Attribute, indent string, m
 	if attr.Sensitive {
 		b.WriteString(contentIndent)
 		b.WriteString(fastSensitive.Render("(sensitive value)"))
-		b.WriteString("\n")
 		return b.String()
 	}
 	if attr.Computed {
 		b.WriteString(contentIndent)
 		b.WriteString(attrComputedStyle.Render("(known after apply)"))
-		b.WriteString("\n")
 		return b.String()
 	}
 
@@ -1090,7 +1095,7 @@ func (m Model) renderMultilineStringBody(attr tfplan.Attribute, indent string, m
 		}
 	}
 
-	return b.String()
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 // tryRenderUserdataAttr detects user_data/user_data_base64 attributes and

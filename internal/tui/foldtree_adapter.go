@@ -137,7 +137,7 @@ func (m *Model) buildAttributeNodes(address string, attrs []tfplan.Attribute, de
 			eotInfo := rowInfo{kind: rowEOT, text: indent + fastMuted.Render("EOT")}
 
 			children := []foldtree.Node{
-				{ID: bodyID, Height: strings.Count(body, "\n"), Payload: bodyInfo},
+				{ID: bodyID, Height: strings.Count(body, "\n") + 1, Payload: bodyInfo},
 				{ID: eotID, Height: 1, Payload: eotInfo},
 			}
 			info := rowInfo{kind: rowMultilineHeader, attr: attr, keyed: keyed}

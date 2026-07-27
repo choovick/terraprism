@@ -165,7 +165,10 @@ func TestMultilineStringGetsBodyAndEOTChildren(t *testing.T) {
 	if bodyInfo.kind != rowMultilineBody {
 		t.Fatalf("first child should be the multiline body")
 	}
-	wantBodyHeight := strings.Count(bodyInfo.text, "\n")
+	// bodyInfo.text has no trailing newline (RenderRow's contract), so
+	// its line count is newlines + 1 -- the same convention leaf rows
+	// use, not a bare newline count.
+	wantBodyHeight := strings.Count(bodyInfo.text, "\n") + 1
 	if header.Children[0].Height != wantBodyHeight {
 		t.Fatalf("body Height = %d, want %d (derived from cached text)", header.Children[0].Height, wantBodyHeight)
 	}
@@ -181,6 +184,54 @@ func TestMultilineStringGetsBodyAndEOTChildren(t *testing.T) {
 	s.SetCollapsed(header.ID, true)
 	if got, want := len(s.Rows()), expandedRows-2; got != want {
 		t.Fatalf("collapsing should hide exactly the body+EOT rows: got %d rows, want %d", got, want)
+	}
+}
+
+// Regression test: renderMultilineStringBody's returned text used to
+// keep its own trailing "\n" on top of the "\n" TreeView.render() always
+// appends after every row, producing a spurious blank line between the
+// diff body and the EOT marker, and making the body's declared Height
+// one line short of what actually rendered (the exact "declared Height
+// disagrees with the real render" bug class this package exists to
+// prevent). Checked here against the real TreeView.View() output, not
+// just re-deriving the same formula the production code uses.
+func TestMultilineStringBodyHasNoBlankLineBeforeEOT(t *testing.T) {
+	old := "line1\nline2\nline3"
+	new := "line1\nCHANGED\nline3"
+	r := tfplan.Resource{
+		Address: "null_resource.a",
+		Attributes: withPaths([]tfplan.Attribute{
+			leaf("script", tfplan.ActionUpdate, tfplan.KindString, old, new),
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+	node := m.buildResourceNode(r)
+	m.treeView.SetTree([]foldtree.Node{node})
+
+	var plainLines []string
+	for _, line := range strings.Split(m.treeView.View(), "\n") {
+		plainLines = append(plainLines, strings.TrimRight(stripANSI(line), " "))
+	}
+
+	eotIdx := -1
+	lastBodyIdx := -1
+	for i, line := range plainLines {
+		if strings.Contains(line, "line3") {
+			lastBodyIdx = i
+		}
+		// The closing EOT row renders as bare "EOT" (no "<<"), distinct
+		// from the header's opening "script = <<EOT" marker.
+		if strings.TrimSpace(line) == "EOT" {
+			eotIdx = i
+			break
+		}
+	}
+	if lastBodyIdx < 0 || eotIdx < 0 {
+		t.Fatalf("expected to find both the last body line and EOT in:\n%v", plainLines)
+	}
+	if eotIdx != lastBodyIdx+1 {
+		t.Fatalf("expected EOT immediately after the last body line (no blank line between), got body at %d, EOT at %d:\n%v",
+			lastBodyIdx, eotIdx, plainLines)
 	}
 }
 
