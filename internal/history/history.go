@@ -179,21 +179,44 @@ func UpdateFilenameWithStatus(oldPath string, status string) (string, error) {
 	return newPath, nil
 }
 
-// readMeta reads just the terraprism_meta block of a history file,
-// without decoding the (potentially large) plan payload into memory as
-// Go values.
+// readMeta reads just the terraprism_meta block of a history file. It
+// streams the file token-by-token and stops as soon as terraprism_meta
+// has been decoded, so it never reads the (potentially many hundreds of
+// MB) plan payload that follows it into memory -- unlike os.ReadFile +
+// json.Unmarshal, which must read and scan the entire file regardless of
+// which fields are actually needed. This matters because readMeta runs
+// once per history file on every plan/apply invocation (via
+// CleanupOldFiles), so its cost is otherwise multiplied by however many
+// history files have accumulated.
 func readMeta(path string) Meta {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return Meta{}
 	}
-	var envelope struct {
-		Meta Meta `json:"terraprism_meta"`
-	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+	if _, err := dec.Token(); err != nil { // consume opening '{'
 		return Meta{}
 	}
-	return envelope.Meta
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return Meta{}
+		}
+		if key, _ := keyTok.(string); key == "terraprism_meta" {
+			var meta Meta
+			if err := dec.Decode(&meta); err != nil {
+				return Meta{}
+			}
+			return meta
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return Meta{}
+		}
+	}
+	return Meta{}
 }
 
 // ListEntries returns all history entries, sorted by timestamp (newest first)
