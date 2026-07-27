@@ -189,8 +189,10 @@ Sort options: default (plan order), by action, by address, by type.
 ### Apply (in apply mode)
 | Key | Action |
 |-----|--------|
-| `a` | Apply the plan |
+| `a` | Apply the plan (only offered once, and only if the plan has changes) |
 | `y` | Confirm apply |
+
+Once apply finishes, a banner shows the result and auto-quits after 10 seconds (press `q` to quit immediately, or `Esc` to cancel the countdown and keep reviewing). Applying again requires a fresh `terraprism apply` (a full re-plan), since the plan file just applied is now stale.
 
 ### Output Pane (plan/apply mode)
 | Key | Action |

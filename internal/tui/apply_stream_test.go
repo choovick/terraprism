@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
 
 const fakeApplyScript = `#!/bin/sh
@@ -139,5 +141,110 @@ func TestHandleKeyApplyRequiresConfirmation(t *testing.T) {
 	}
 	if !updated.confirmApply {
 		t.Fatalf("expected confirmApply=true after the first 'a' press")
+	}
+}
+
+// A plan with nothing to apply (e.g. "No changes. Infrastructure is
+// up-to-date.") must never let 'a' arm the apply confirmation -- there's
+// nothing for it to do.
+func TestHandleKeyApplyDisabledWhenPlanHasNoChanges(t *testing.T) {
+	m := NewModelWithApply(&tfplan.Plan{}, "/dev/null", "true", "", "")
+	m.applyMode = true
+
+	updated, cmd, _ := handleKeyApply(m)
+	if updated.confirmApply || cmd != nil {
+		t.Fatalf("expected 'a' to be a no-op on a plan with no changes")
+	}
+	if strings.Contains(m.viewHelpFooter(), "a: APPLY") {
+		t.Fatalf("footer should not advertise 'a: APPLY' when the plan has no changes:\n%s", m.viewHelpFooter())
+	}
+}
+
+// Once an apply has been attempted (successful or not), the plan file
+// it targeted is stale -- 'a'/'y' must not be able to start a second
+// apply against it. A fresh `terraprism apply` (full re-plan) is
+// required instead.
+func TestReApplyBlockedAfterApplyAttempted(t *testing.T) {
+	fake := writeFakeApplyScript(t)
+	t.Setenv("FAKE_APPLY_LINES", "apply complete!")
+
+	m := NewModelWithApply(simplePlan(), "/dev/null", fake, "", "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	mm := model.(Model)
+	mm.applyMode = true
+	mm.confirmApply = true
+
+	updated, cmd, _ := handleKeyConfirmApply(mm)
+	final := driveApplyToCompletion(t, updated, cmd)
+	if !final.applyAttempted {
+		t.Fatalf("setup: expected applyAttempted=true after the first apply")
+	}
+
+	afterA, cmdA, _ := handleKeyApply(final)
+	if afterA.confirmApply || cmdA != nil {
+		t.Fatalf("expected 'a' to be a no-op once an apply has already been attempted")
+	}
+
+	// Even if confirmApply were somehow still set, 'y' must not start a
+	// second apply either.
+	afterA.confirmApply = true
+	afterY, cmdY, _ := handleKeyConfirmApply(afterA)
+	if afterY.applying || cmdY != nil {
+		t.Fatalf("expected 'y' to be a no-op once an apply has already been attempted")
+	}
+
+	if strings.Contains(final.viewHelpFooter(), "a: APPLY") {
+		t.Fatalf("footer should not advertise 'a: APPLY' once an apply has already run:\n%s", final.viewHelpFooter())
+	}
+}
+
+// After apply finishes, the completion banner must show a live
+// countdown to auto-quit, and Esc must cancel it (leaving the banner in
+// place, minus the countdown, rather than quitting or hiding it).
+func TestApplyCompletionBannerCountdownAndEscCancel(t *testing.T) {
+	fake := writeFakeApplyScript(t)
+	t.Setenv("FAKE_APPLY_LINES", "apply complete!")
+
+	m := NewModelWithApply(simplePlan(), "/dev/null", fake, "", "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	mm := model.(Model)
+	mm.applyMode = true
+	mm.confirmApply = true
+
+	updated, cmd, _ := handleKeyConfirmApply(mm)
+	final := driveApplyToCompletion(t, updated, cmd)
+
+	if final.applyQuitCountdown != applyQuitCountdownStart {
+		t.Fatalf("expected countdown to start at %d, got %d", applyQuitCountdownStart, final.applyQuitCountdown)
+	}
+	banner := final.viewConfirmationPrompt()
+	if !strings.Contains(banner, "Apply complete!") || !strings.Contains(banner, "quitting in") {
+		t.Fatalf("expected completion banner with countdown, got:\n%s", banner)
+	}
+
+	cancelled, cancelCmd, _ := handleKeyEsc(final)
+	if cancelCmd != nil {
+		t.Fatalf("expected Esc-cancel to return a nil cmd")
+	}
+	if cancelled.applyQuitCountdown != 0 {
+		t.Fatalf("expected Esc to zero the countdown, got %d", cancelled.applyQuitCountdown)
+	}
+	cancelledBanner := cancelled.viewConfirmationPrompt()
+	if !strings.Contains(cancelledBanner, "Apply complete!") {
+		t.Fatalf("expected the banner to remain after cancelling the countdown, got:\n%s", cancelledBanner)
+	}
+	if strings.Contains(cancelledBanner, "quitting in") {
+		t.Fatalf("expected the countdown text gone after Esc, got:\n%s", cancelledBanner)
+	}
+
+	// A tick scheduled before the cancel must not resurrect the countdown
+	// or quit once it fires.
+	afterStaleTick, tickCmd := cancelled.Update(applyQuitTickMsg{})
+	afterStaleTickModel := afterStaleTick.(Model)
+	if afterStaleTickModel.applyQuitCountdown != 0 {
+		t.Fatalf("expected a stale tick after cancellation to stay a no-op, got countdown=%d", afterStaleTickModel.applyQuitCountdown)
+	}
+	if tickCmd != nil {
+		t.Fatalf("expected a stale tick after cancellation not to re-arm")
 	}
 }

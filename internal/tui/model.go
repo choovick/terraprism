@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -49,6 +50,12 @@ type Model struct {
 	applyResult    error  // nil until applyAttempted && !applying; nil then means success
 	applyLines     <-chan runner.ApplyLine
 	applyDone      <-chan error
+
+	// applyQuitCountdown counts down the seconds left before the TUI
+	// auto-quits after an apply finishes (success or failure); 0 means
+	// no countdown is running (either none has started yet, or Esc
+	// cancelled it -- see handleKeyEsc).
+	applyQuitCountdown int
 
 	// Status filter fields
 	filterPicker foldtree.Picker[tfplan.Action]
@@ -429,7 +436,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case applyDoneMsg:
 		m.applying = false
 		m.applyResult = msg.err
-		return m, nil
+		m.applyQuitCountdown = applyQuitCountdownStart
+		return m, tickApplyQuitCmd()
+
+	case applyQuitTickMsg:
+		if m.applyQuitCountdown <= 0 {
+			return m, nil // cancelled via Esc since this tick was scheduled
+		}
+		m.applyQuitCountdown--
+		if m.applyQuitCountdown <= 0 {
+			return m, tea.Quit
+		}
+		return m, tickApplyQuitCmd()
 
 	case planStreamStartedMsg:
 		m.planLines = msg.lines
@@ -544,6 +562,10 @@ func handleKeySort(m Model) (Model, tea.Cmd, bool) {
 }
 
 func handleKeyEsc(m Model) (Model, tea.Cmd, bool) {
+	if m.applyQuitCountdown > 0 {
+		m.applyQuitCountdown = 0
+		return m, nil, true
+	}
 	if len(m.filterPicker.Selected) > 0 {
 		for k := range m.filterPicker.Selected {
 			delete(m.filterPicker.Selected, k)
@@ -568,8 +590,15 @@ func handleKeyDecreaseDiffContext(m Model) (Model, tea.Cmd, bool) {
 	return m, nil, true
 }
 
+// handleKeyApply opens the apply confirmation, but only once per plan:
+// applyAttempted stays true for the rest of the session once an apply
+// has started (successful or not), since the plan file it targets is
+// now stale -- either the infrastructure already matches it (success)
+// or it's unclear what actually happened (failure/partial apply either
+// way). Re-applying the same plan isn't safe; a fresh `terraprism
+// apply` (a full re-plan) is required instead.
 func handleKeyApply(m Model) (Model, tea.Cmd, bool) {
-	if m.applyMode && !m.planning {
+	if m.applyMode && !m.planning && !m.applyAttempted && m.hasApplicableChanges() {
 		if m.confirmApply {
 			return m.startApply()
 		}
@@ -579,10 +608,18 @@ func handleKeyApply(m Model) (Model, tea.Cmd, bool) {
 }
 
 func handleKeyConfirmApply(m Model) (Model, tea.Cmd, bool) {
-	if m.applyMode && m.confirmApply && !m.planning {
+	if m.applyMode && m.confirmApply && !m.planning && !m.applyAttempted && m.hasApplicableChanges() {
 		return m.startApply()
 	}
 	return m, nil, true
+}
+
+// hasApplicableChanges reports whether the plan has anything for apply
+// to actually do -- the same condition main.go uses for its own "No
+// changes. Infrastructure is up-to-date." message, reused here so a
+// plan with zero changes never offers 'a: APPLY' in the first place.
+func (m Model) hasApplicableChanges() bool {
+	return len(m.plan.DisplayResources()) > 0
 }
 
 // startApply confirms the apply and kicks off runner.ApplyStream as a
@@ -607,6 +644,20 @@ type applyLineMsg runner.ApplyLine
 
 // applyDoneMsg reports the apply subprocess's final result.
 type applyDoneMsg struct{ err error }
+
+// applyQuitCountdownStart is how many seconds the TUI waits after an
+// apply finishes (success or failure) before auto-quitting, unless Esc
+// cancels it first (see handleKeyEsc).
+const applyQuitCountdownStart = 10
+
+// applyQuitTickMsg fires once a second while the post-apply auto-quit
+// countdown is running.
+type applyQuitTickMsg struct{}
+
+// tickApplyQuitCmd schedules the next applyQuitTickMsg one second out.
+func tickApplyQuitCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return applyQuitTickMsg{} })
+}
 
 func (m Model) startApplyCmd() tea.Cmd {
 	tfCommand, planFile := m.tfCommand, m.planFile
@@ -1494,6 +1545,9 @@ func (m Model) viewConfirmationPrompt() string {
 			Padding(0, 2)
 		return "\n" + style.Render("⏳ Applying... quit is disabled until it finishes") + "\n\n"
 	}
+	if m.applyAttempted {
+		return m.viewApplyCompletionBanner()
+	}
 	if !m.confirmApply {
 		return ""
 	}
@@ -1503,6 +1557,31 @@ func (m Model) viewConfirmationPrompt() string {
 		Bold(true).
 		Padding(0, 2)
 	return "\n" + confirmStyle.Render("⚠️  Apply this plan? Press 'y' to confirm, any other key to cancel") + "\n\n"
+}
+
+// viewApplyCompletionBanner renders the post-apply status once the
+// subprocess has finished (success or failure), including the auto-quit
+// countdown while it's running. Re-applying is never offered again from
+// here -- the plan file is stale either way, so getting a fresh one
+// means quitting and running `terraprism apply` again.
+func (m Model) viewApplyCompletionBanner() string {
+	bg := createColor
+	msg := "✓ Apply complete!"
+	if m.applyResult != nil {
+		bg = destroyColor
+		msg = fmt.Sprintf("✗ Apply failed: %v", m.applyResult)
+	}
+	if m.applyQuitCountdown > 0 {
+		msg += fmt.Sprintf(" — quitting in %ds (q: now, Esc: stay)", m.applyQuitCountdown)
+	} else {
+		msg += " — q: quit"
+	}
+	style := lipgloss.NewStyle().
+		Background(bg).
+		Foreground(textColor).
+		Bold(true).
+		Padding(0, 2)
+	return "\n" + style.Render(msg) + "\n\n"
 }
 
 // viewHelpFooter returns the help footer text.
@@ -1534,11 +1613,25 @@ func (m Model) viewHelpFooter() string {
 		if m.confirmApply {
 			return "y: confirm apply • any key: cancel"
 		}
-		applyHint := lipgloss.NewStyle().Foreground(createColor).Bold(true).Render("a: APPLY")
 		outputHint := ""
 		if m.planOutput != "" {
 			outputHint = " • o: output"
 		}
+		// No 'a: APPLY' hint once it's already run (viewApplyCompletionBanner
+		// covers that state instead) or if the plan has nothing to apply --
+		// in either case there's nothing this key would do.
+		if m.applyAttempted || !m.hasApplicableChanges() {
+			full := fmt.Sprintf("j/k/↑↓: navigate • e/c: scope • E/C: all • /: search • f: filter • s: sort%s • q: quit", outputHint)
+			if lipgloss.Width(full) <= maxWidth {
+				return full
+			}
+			medium := fmt.Sprintf("j/k nav • e/c scope • E/C all • / search%s • q", outputHint)
+			if lipgloss.Width(medium) <= maxWidth {
+				return medium
+			}
+			return "j/k nav • e/c • / search • q"
+		}
+		applyHint := lipgloss.NewStyle().Foreground(createColor).Bold(true).Render("a: APPLY")
 		full := fmt.Sprintf("%s • j/k/↑↓: navigate • e/c: scope • E/C: all • /: search • f: filter • s: sort%s • q: quit", applyHint, outputHint)
 		if lipgloss.Width(full) <= maxWidth {
 			return full
