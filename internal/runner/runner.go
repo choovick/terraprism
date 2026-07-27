@@ -132,7 +132,7 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 	planCmd.Stderr = pw
 
 	if err := planCmd.Start(); err != nil {
-		pw.Close()
+		_ = pw.Close()
 		close(lines)
 		done <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Err: err}}
 		close(done)
@@ -142,7 +142,7 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 	waitErr := make(chan error, 1)
 	go func() {
 		waitErr <- planCmd.Wait()
-		pw.Close()
+		_ = pw.Close()
 	}()
 
 	go func() {
@@ -157,7 +157,7 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 		close(lines)
 
 		if err := <-waitErr; err != nil {
-			os.Remove(planFile)
+			_ = os.Remove(planFile)
 			done <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Output: output.Bytes(), Err: err}}
 			close(done)
 			return
@@ -168,7 +168,7 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 		jsonBytes, err := showCmd.Output()
 		if err != nil {
 			if !opts.KeepPlanFile {
-				os.Remove(planFile)
+				_ = os.Remove(planFile)
 			}
 			var stderr []byte
 			if exitErr, ok := err.(*exec.ExitError); ok {
@@ -182,7 +182,7 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 		plan, err := tfplan.DecodeBytes(jsonBytes)
 		if err != nil {
 			if !opts.KeepPlanFile {
-				os.Remove(planFile)
+				_ = os.Remove(planFile)
 			}
 			done <- PlanStreamResult{Err: fmt.Errorf("decoding plan JSON: %w", err)}
 			close(done)
@@ -191,7 +191,7 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 
 		result := &PlanResult{Plan: plan, RawJSON: jsonBytes, PlanFile: planFile, Output: output.Bytes()}
 		if !opts.KeepPlanFile {
-			os.Remove(planFile)
+			_ = os.Remove(planFile)
 			result.PlanFile = ""
 		}
 		done <- PlanStreamResult{Result: result}
@@ -234,7 +234,7 @@ func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan Ap
 	applyCmd.Stderr = pw
 
 	if err := applyCmd.Start(); err != nil {
-		pw.Close()
+		_ = pw.Close()
 		close(lines)
 		done <- err
 		close(done)
@@ -244,7 +244,7 @@ func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan Ap
 	waitErr := make(chan error, 1)
 	go func() {
 		waitErr <- applyCmd.Wait()
-		pw.Close()
+		_ = pw.Close()
 	}()
 
 	go func() {
