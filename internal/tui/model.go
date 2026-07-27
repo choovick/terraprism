@@ -472,6 +472,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.outputPane.SetVisible(false)
 		m.rebuildTree()
 		m.reflow()
+		if !m.hasApplicableChanges() {
+			// Nothing to review or apply -- the live-streamed plan output
+			// already showed this while planning ran, and main.go prints
+			// "No changes. Infrastructure is up-to-date." right after the
+			// TUI exits either way, so there's no reason to make the user
+			// press 'q' themselves on an empty tree.
+			return m, tea.Quit
+		}
 		return m, nil
 	}
 

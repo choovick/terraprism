@@ -13,6 +13,8 @@ import (
 
 const validPlanJSONForTUI = `{"format_version":"1.2","terraform_version":"1.7.5","resource_changes":[{"address":"null_resource.x","mode":"managed","type":"null_resource","name":"x","change":{"actions":["create"],"before":null,"after":{}}}],"output_changes":{}}`
 
+const noChangesPlanJSONForTUI = `{"format_version":"1.2","terraform_version":"1.7.5","resource_changes":[],"output_changes":{}}`
+
 const fakePlanScript = `#!/bin/sh
 outfile=""
 case "$1" in
@@ -185,5 +187,48 @@ func TestNewModelPlanningFailureKeepsEmptyTreeAndAllowsQuit(t *testing.T) {
 	_, quitCmd, _ := handleKeyQuit(final)
 	if quitCmd == nil {
 		t.Fatalf("expected quit to work once a failed plan has finished")
+	}
+}
+
+// A plan with nothing to add/change/destroy leaves an empty tree with
+// nothing to review -- the TUI should auto-quit once it lands rather
+// than making the user press 'q' on their own, since the live-streamed
+// plan output already showed this while planning ran, and main.go
+// prints "No changes. Infrastructure is up-to-date." right after the
+// TUI exits either way.
+func TestNewModelPlanningAutoQuitsWhenPlanHasNoChanges(t *testing.T) {
+	fake := writeFakePlanScript(t)
+	t.Setenv("FAKE_SHOW_STDOUT", noChangesPlanJSONForTUI)
+
+	m := NewModelPlanning(runner.Options{Cmd: runner.TFCommand(fake)}, "", true)
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	mm := model.(Model)
+	cmd := mm.Init()
+
+	var doneCmd tea.Cmd
+	for i := 0; i < 1000; i++ {
+		if cmd == nil {
+			t.Fatalf("expected a non-nil cmd while planning is still in flight")
+		}
+		msg := cmd()
+		var newModel tea.Model
+		newModel, cmd = mm.Update(msg)
+		mm = newModel.(Model)
+		if _, ok := msg.(planDoneMsg); ok {
+			doneCmd = cmd
+			break
+		}
+	}
+	if doneCmd == nil {
+		t.Fatalf("planning did not complete within 1000 messages")
+	}
+	if mm.planning {
+		t.Fatalf("expected planning=false once the stream completes")
+	}
+	if mm.hasApplicableChanges() {
+		t.Fatalf("setup: expected a no-changes plan")
+	}
+	if _, ok := doneCmd().(tea.QuitMsg); !ok {
+		t.Fatalf("expected planDoneMsg on a no-changes plan to return tea.Quit")
 	}
 }
