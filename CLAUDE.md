@@ -43,6 +43,19 @@ golangci-lint run ./...
 - Table-driven tests with subtests (`t.Run`), `t.Parallel()` where safe
 - Test data colocated per-package (e.g. `internal/tfplan/testdata/*.json`)
 - Test files colocated with source (`*_test.go`)
+- Prefer real stand-in implementations over mocks (e.g. a fake shell
+  script for subprocess/streaming code, real `tea.Model` update cycles
+  for TUI components) so tests exercise the same path production does
+- Reduce real-world bugs to a minimal synthetic fixture rather than
+  checking in real/sensitive data
+- Redirect fixed filesystem paths (e.g. `$HOME`) to a temp dir via
+  `t.Setenv` instead of mocking the filesystem
+- Strip ANSI codes before asserting on rendered text
+- Name regression tests after the failure scenario they guard, not just
+  the function under test
+- Verify performance fixes with a benchmark, not just code inspection
+- Fuzz/property-test core invariants where inputs are hard to enumerate
+  by hand (e.g. tree navigation boundaries)
 
 ## Dependencies
 

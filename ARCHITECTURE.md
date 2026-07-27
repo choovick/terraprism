@@ -99,10 +99,10 @@ file(s) they test where the mapping is obvious.
 - **`query.go`** — Read-only accessors on `State` (`SelectedID`, `Offset`, `Rows`, `VisibleRange`, `RowVisible`, etc.).
 - **`search.go`** — `FuzzyMatch`, the exported fuzzy-matching predicate `TreeView`'s search is built on.
 - **`picker.go`** — `Picker[T]`, a generic single/multi-select overlay widget (cursor, checkbox/marker rendering, select-all/clear-all).
-- **`log_pane.go`** — `LogPane`, an append-only autoscrolling text pane with its own `g`/`G` navigation and `/`-search.
+- **`log_pane.go`** — `LogPane`, an append-only autoscrolling text pane with its own `g`/`G` navigation, `/`-search with match highlighting, toggleable word wrap (`w`, off by default, hard-wrapping unbreakable tokens so wrap and horizontal scroll are never both needed at once), and `h`/`l` horizontal scrolling.
 - **`tree_view.go`** — `TreeView`, the full `tea.Model` combining `State` with rendering (via a caller-supplied `RowRenderer`) and search.
 - **`split_view.go`** — `SplitView`, a generic primary+collapsible-auxiliary pane compositor with height allocation and focus-based key routing.
-- **`styles.go`** — Minimal default lipgloss styles for foldtree's own chrome (selection highlight, muted text) — callers rendering their own rows ignore these entirely.
+- **`styles.go`** — Minimal default lipgloss styles for foldtree's own chrome (selection highlight, muted text, search-match highlight) — callers rendering their own rows ignore these entirely.
 - **`foldtree_test.go`** — Tests `Flatten`'s ordering, depth, collapse behavior, and `Payload` round-tripping.
 - **`state_test.go`** — Tests `State`'s core cursor/scroll/collapse behavior and `SelectIndex`.
 - **`move.go` / `query.go` behavior** is additionally covered by **`boundary_test.go`** (generalized regressions for real scroll/oscillation bugs found against production plans) and **`structure_test.go`** (adversarial shapes: negative heights, duplicate IDs, zero-height rows).
@@ -329,7 +329,21 @@ Notable properties of this model:
   Terraform's `before_sensitive`/`after_sensitive`/`after_unknown` are
   themselves value-shaped trees of booleans (e.g. `{"tags":{"Name":true}}`
   marks only `tags.Name` sensitive, not the whole map), so `Sensitive`/
-  `Computed` are resolved at the same path-by-path granularity.
+  `Computed` are resolved at the same path-by-path granularity. When a
+  container's `after_unknown` is the bare bool `true` rather than a
+  per-child map (its whole subtree is unknown, not just specific fields),
+  every child inherits `Computed` from the parent rather than defaulting
+  to "known" — there's no per-child entry to consult in that shape.
+- **Unknown takes priority over "missing," not just "changed."**
+  Terraform's plan JSON omits an attribute from `after` entirely when its
+  value is wholly unknown — the same encoding it uses for a genuine
+  deletion. An attribute that existed before and becomes unknown on
+  update (e.g. a `helm_release`'s `metadata` block once any upstream
+  input it depends on is itself unknown) would misread as deleted if
+  existence were checked before the unknown flag; `diffAction`/
+  `aggregateAction` check unknown first specifically for this
+  `beforeExists && !afterExists` case, while still treating a truly
+  absent-on-both-sides or newly-created attribute the same as before.
 - **Outputs become synthetic resources for display.** `OutputChange`
   is a real, separate concept in the data model, but `Plan.DisplayResources()`
   flattens it into the same `[]Resource` shape (labeled `ActionOutput`)
@@ -483,10 +497,14 @@ parses/renders plan JSON, it doesn't provision anything:
 
 - `internal/tfplan/testdata/*.json` — hand-authored fixtures for specific
   edge cases (nested sensitivity paths, replace-pattern direction,
-  zero-change plans) plus real fixtures captured once from `terraform`
-  and `tofu` against no-network providers (`null_resource`, `random_id`),
-  to catch schema drift between the hand-written fixtures and what the
-  engines actually emit.
+  zero-change plans, an attribute becoming wholly unknown on update)
+  plus real fixtures captured once from `terraform` and `tofu` against
+  no-network providers (`null_resource`, `random_id`), to catch schema
+  drift between the hand-written fixtures and what the engines actually
+  emit. Edge cases found against real production plans are reduced to
+  the smallest fixture reproducing the same JSON shape rather than
+  checking in the original (often large, and never something else's
+  infrastructure data belongs in this repo).
 - `internal/runner` tests point `Options.Cmd` at a stand-in shell script
   instead of shimming `PATH`, since `Cmd` is just an executable path.
 - `internal/history` tests redirect `$HOME` to a `t.TempDir()`.

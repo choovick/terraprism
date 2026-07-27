@@ -26,6 +26,7 @@
 
 ## Features
 
+- **Live output streaming** - The TUI opens immediately for `plan`/`apply`/`destroy`; a hideable pane streams terraform/tofu's real output live, with its own search, word wrap, and horizontal scroll
 - **Syntax-highlighted HCL** - Full color-coded display of your plan
 - **Collapsible resources and sub-blocks** - Expand/collapse resources, large maps, lists, and heredocs
 - **Status filter** - Filter resources by action (create, destroy, update, replace, read, etc.)
@@ -190,6 +191,20 @@ Sort options: default (plan order), by action, by address, by type.
 |-----|--------|
 | `a` | Apply the plan |
 | `y` | Confirm apply |
+
+### Output Pane (plan/apply mode)
+| Key | Action |
+|-----|--------|
+| `o` | Toggle the live terraform/tofu output pane |
+| `j`/`k`, `gg`/`G` | Navigate the pane |
+| `/`, `n`/`N` | Search within the pane, highlighting matches; cycle matches |
+| `w` | Toggle word wrap (off by default) |
+| `h`/`l` or `←`/`→` | Scroll sideways (when word wrap is off) |
+
+The pane opens automatically as soon as `plan` starts, before it even
+finishes, and again when `apply` starts once confirmed — quitting is
+disabled for the duration of either so a running `terraform`/`tofu`
+process is never orphaned.
 
 ### State Mode (state list/show/rm)
 | Key | Action |
