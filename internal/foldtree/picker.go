@@ -77,8 +77,15 @@ func (p *Picker[T]) SetCurrent(v T) {
 func (p *Picker[T]) Current() T { return p.current }
 
 // Highlighted returns the option currently under the cursor — the
-// single-select "current choice" once PickerApply is returned.
+// single-select "current choice" once PickerApply is returned. Returns
+// the zero value of T if there are no options (e.g. a dynamically
+// populated picker filtered down to nothing) rather than panicking,
+// matching the same empty-Options guard Update already applies.
 func (p *Picker[T]) Highlighted() T {
+	if len(p.Options) == 0 {
+		var zero T
+		return zero
+	}
 	return p.Options[p.cursor]
 }
 

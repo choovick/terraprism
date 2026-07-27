@@ -165,3 +165,23 @@ func TestPickerEmptyOptionsIsSafe(t *testing.T) {
 		t.Fatalf("expected empty view for zero options, got %q", p.View())
 	}
 }
+
+// Regression test: single-select Update returns PickerApply
+// unconditionally on Enter/Space, with no empty-Options guard -- a
+// caller that then reads Highlighted() to get the confirmed choice
+// would panic (index out of range) on a picker dynamically filtered
+// down to zero options. Highlighted() must return the zero value
+// instead, matching the same guard Update already applies elsewhere.
+func TestPickerHighlightedIsSafeOnEmptyOptions(t *testing.T) {
+	p := NewPicker([]string{}, func(s string) string { return s })
+	if got := p.Highlighted(); got != "" {
+		t.Fatalf("Highlighted() on empty picker = %q, want zero value", got)
+	}
+
+	if action := p.Update(key("enter")); action != PickerApply {
+		t.Fatalf("Update(enter) on empty picker = %v, want PickerApply", action)
+	}
+	if got := p.Highlighted(); got != "" {
+		t.Fatalf("Highlighted() after PickerApply on empty picker = %q, want zero value", got)
+	}
+}
