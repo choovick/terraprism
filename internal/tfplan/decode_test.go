@@ -186,6 +186,41 @@ func TestDecode(t *testing.T) {
 			},
 		},
 		{
+			// Regression test: an attribute that existed before and becomes
+			// wholly unknown on update (after_unknown: true as a bare bool,
+			// not a per-child map) must be classified as ActionUpdate with
+			// Computed true -- both for the attribute itself and every one
+			// of its children -- not ActionDelete. Terraform's plan JSON
+			// omits such an attribute from "after" entirely, the same
+			// encoding it uses for a genuine deletion, so existence alone
+			// can't distinguish the two cases; the unknown flag must be
+			// checked first.
+			name:    "attribute becoming unknown on update is Update, not Delete",
+			fixture: "plan_update_becomes_unknown.json",
+			check: func(t *testing.T, p *Plan) {
+				if len(p.Resources) != 1 {
+					t.Fatalf("got %d resources, want 1", len(p.Resources))
+				}
+				res := p.Resources[0]
+
+				id := findAttr(t, res.Attributes, "id")
+				if id.Action != ActionUpdate || !id.Computed {
+					t.Errorf("id: action=%s computed=%v, want update/true", id.Action, id.Computed)
+				}
+
+				metadata := findAttr(t, res.Attributes, "metadata")
+				if metadata.Action != ActionUpdate || !metadata.Computed {
+					t.Errorf("metadata: action=%s computed=%v, want update/true", metadata.Action, metadata.Computed)
+				}
+				for _, name := range []string{"app_version", "chart", "revision"} {
+					child := findAttr(t, metadata.Children, name)
+					if child.Action != ActionUpdate || !child.Computed {
+						t.Errorf("metadata.%s: action=%s computed=%v, want update/true", name, child.Action, child.Computed)
+					}
+				}
+			},
+		},
+		{
 			name:    "opentofu capture decodes cleanly",
 			fixture: "plan_opentofu_capture.json",
 			check: func(t *testing.T, p *Plan) {

@@ -159,6 +159,39 @@ func TestRenderGenericLargeBlockCollapsesByDefault(t *testing.T) {
 	}
 }
 
+// A collapsed container whose entire value is unknown after apply (e.g. a
+// helm_release's "metadata" block, wholly unknown on update) must show
+// "(known after apply)" on its own collapsed summary line -- otherwise
+// that's only visible per-field once expanded, and collapsing hides the
+// one piece of information ("this whole block isn't knowable yet") that
+// matters most while collapsed.
+func TestCollapsedComputedContainerShowsKnownAfterApply(t *testing.T) {
+	children := make([]tfplan.Attribute, 0, 35)
+	for i := 0; i < 35; i++ {
+		children = append(children, leaf("key"+string(rune('a'+i%26)), tfplan.ActionUpdate, tfplan.KindString, "value", nil))
+	}
+	metadata := tfplan.Attribute{
+		Name:     "metadata",
+		Kind:     tfplan.KindMap,
+		Action:   tfplan.ActionUpdate,
+		Computed: true,
+		Children: children,
+	}
+
+	r := tfplan.Resource{
+		Address:    "helm_release.chart",
+		Type:       "helm_release",
+		Action:     tfplan.ActionUpdate,
+		Attributes: withPaths([]tfplan.Attribute{metadata}, ""),
+	}
+
+	got := renderResourceForTest(r, 0)
+
+	if !strings.Contains(got, "▶ ~ metadata = { ... 35 attrs } (known after apply)") {
+		t.Fatalf("expected collapsed metadata block to show (known after apply):\n%s", got)
+	}
+}
+
 // A changed multi-line string is structurally a single Attribute with one
 // Old and one New value — there's no "pairing" step needed the way the old
 // heredoc-marker text parser needed to pair a removed block with an added

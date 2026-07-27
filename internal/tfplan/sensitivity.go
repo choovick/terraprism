@@ -72,8 +72,17 @@ func buildMapAttribute(name, path string, before, after any, beforeExists, after
 		childPath := path + "." + k
 		bv, bExists := beforeMap[k]
 		av, aExists := afterMap[k]
+		childUnknown := any(unknownMap[k])
+		if unknownHere {
+			// afterUnknown for this container was the bare bool true, not a
+			// per-child map -- "this entire subtree is unknown, stop here"
+			// (see buildAttribute's doc comment) -- so there's no per-child
+			// unknown entry to consult. Every child inherits unknown from
+			// the container.
+			childUnknown = true
+		}
 		children = append(children, buildAttribute(k, childPath, bv, av, bExists, aExists,
-			unknownMap[k], beforeSensMap[k], afterSensMap[k]))
+			childUnknown, beforeSensMap[k], afterSensMap[k]))
 	}
 
 	return Attribute{
@@ -119,6 +128,13 @@ func buildListAttribute(name, path string, before, after any, beforeExists, afte
 		if i < len(afterSensList) {
 			as = afterSensList[i]
 		}
+		if unknownHere {
+			// See the identical branch in buildMapAttribute: afterUnknown
+			// was the bare bool true for this whole list, so there's no
+			// per-element unknown entry to consult. Every element inherits
+			// unknown from the list.
+			u = true
+		}
 		children = append(children, buildAttribute(fmt.Sprintf("%d", i), childPath, b, a, bExists, aExists, u, bs, as))
 	}
 
@@ -136,16 +152,22 @@ func buildListAttribute(name, path string, before, after any, beforeExists, afte
 // side (not nil-ness of the decoded value, which can't distinguish an
 // explicit JSON null from a genuinely absent key) and, when present on
 // both sides, direct value comparison. Existence is checked before the
-// unknown flag: a newly-created attribute whose value happens to be
-// unknown is still a create (rendered as "(known after apply)" via the
-// separate Computed flag), not an "update" showing a confusing
-// "null → (known after apply)" arrow.
+// unknown flag for the create case: a newly-created attribute whose
+// value happens to be unknown is still a create (rendered as "(known
+// after apply)" via the separate Computed flag), not an "update" showing
+// a confusing "null → (known after apply)" arrow. But an attribute that
+// existed before and has become wholly unknown is still an update, even
+// though Terraform's plan JSON omits it from "after" entirely (the same
+// encoding it uses for "genuinely deleted") -- unknown is checked before
+// treating a missing "after" as a delete, specifically for that case.
 func diffAction(before, after any, beforeExists, afterExists, unknown bool) Action {
 	switch {
 	case !beforeExists && !afterExists:
 		return ActionNoOp
 	case !beforeExists && afterExists:
 		return ActionCreate
+	case beforeExists && !afterExists && unknown:
+		return ActionUpdate
 	case beforeExists && !afterExists:
 		return ActionDelete
 	case unknown:
@@ -166,6 +188,8 @@ func aggregateAction(children []Attribute, beforeExists, afterExists bool, unkno
 		return ActionNoOp
 	case !beforeExists && afterExists:
 		return ActionCreate
+	case beforeExists && !afterExists && unknown:
+		return ActionUpdate
 	case beforeExists && !afterExists:
 		return ActionDelete
 	case unknown:

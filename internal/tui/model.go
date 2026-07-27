@@ -918,6 +918,9 @@ func (m Model) renderFoldHeader(indent string, attr tfplan.Attribute, keyed, col
 	result := indent + indicator + " " + actionPrefixSymbol(attr.Action) + " " + content
 	if collapsed {
 		result += fastMuted.Render(" ... " + collapsedSummary)
+		if attr.Computed {
+			result += " " + fastAttrComputed.Render("(known after apply)")
+		}
 	}
 
 	if !selected {
