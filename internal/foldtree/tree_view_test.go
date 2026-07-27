@@ -253,6 +253,41 @@ func TestTreeViewExpandCollapseCurrentKeys(t *testing.T) {
 	}
 }
 
+// A leaf has nothing of its own to collapse, so 'c' must climb to its
+// parent and collapse that branch instead -- otherwise 'c' silently
+// does nothing whenever the cursor sits on a leaf, which is most of the
+// time in a real attribute tree.
+func TestTreeViewCKeyOnLeafCollapsesParent(t *testing.T) {
+	tv := newTestTreeView(40, 10)
+	sendKey(tv, "down") // alpha -> alpha.1 (a leaf)
+	if id, _ := tv.nav.SelectedID(); id != "alpha.1" {
+		t.Fatalf("setup: expected selection on alpha.1, got %q", id)
+	}
+
+	sendKey(tv, "c")
+
+	if id, _ := tv.nav.SelectedID(); id != "alpha" {
+		t.Fatalf("expected 'c' on a leaf to move selection to its parent (alpha), got %q", id)
+	}
+	if strings.Contains(tv.View(), "alpha.1") {
+		t.Fatalf("expected 'c' on a leaf to collapse its parent, hiding alpha.1:\n%s", tv.View())
+	}
+}
+
+// 'c' on a root row with no parent to climb to (and nothing of its own
+// to collapse) falls back to collapsing the whole tree, matching 'C'.
+func TestTreeViewCKeyOnRootLeafCollapsesAll(t *testing.T) {
+	tv := newTestTreeView(40, 10)
+	sendKey(tv, "G") // jump to gamma, a root leaf
+
+	sendKey(tv, "c")
+
+	view := tv.View()
+	if strings.Contains(view, "alpha.1") || strings.Contains(view, "beta.1") {
+		t.Fatalf("expected 'c' on a root leaf to collapse the whole tree:\n%s", view)
+	}
+}
+
 func TestTreeViewGGTopAndShiftGBottom(t *testing.T) {
 	tv := newTestTreeView(40, 10)
 	sendKey(tv, "down")

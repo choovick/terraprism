@@ -185,9 +185,7 @@ func (t TreeView) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "E":
 		t.nav.ExpandAll()
 	case "c":
-		if id, ok := t.nav.SelectedID(); ok {
-			t.nav.CollapseSubtree(id)
-		}
+		t.collapseCurrent()
 	case "C":
 		t.nav.CollapseAll()
 	case "h", "left", "backspace":
@@ -330,6 +328,34 @@ func (t *TreeView) selectAdjacentRoot(dir int) {
 	}
 	pos = ((pos+dir)%len(roots) + len(roots)) % len(roots)
 	t.nav.SelectIndex(roots[pos])
+}
+
+// collapseCurrent recursively collapses the current node's whole
+// branch. If there's nothing left to collapse there (a leaf, or already
+// collapsed), it climbs to the parent and collapses that branch
+// instead, moving the selection up with it -- so repeated presses walk
+// up the tree one level at a time. Once there's no parent left to climb
+// to (already at a root), it falls back to collapsing the whole tree,
+// same as pressing C directly.
+func (t *TreeView) collapseCurrent() {
+	idx := t.nav.SelectedIndex()
+	if idx < 0 {
+		return
+	}
+	row := t.nav.Rows()[idx]
+	if row.HasChildren && !row.Collapsed {
+		t.nav.CollapseSubtree(row.ID)
+		return
+	}
+
+	id := row.ID
+	t.nav.SelectParent()
+	parentID, ok := t.nav.SelectedID()
+	if !ok || parentID == id {
+		t.nav.CollapseAll()
+		return
+	}
+	t.nav.CollapseSubtree(parentID)
 }
 
 // matchStatus returns the 0-based position of the selected row's
