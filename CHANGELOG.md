@@ -52,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restored fold/collapse for multi-line string diffs, fixed viewport
   oscillation/drift at free-scroll boundaries, and fixed mouse-wheel
   scroll snapping at the top/bottom of the list.
+- CI: `golangci-lint` was failing outright — `.golangci.yml` uses the v2
+  config schema, but CI was pinned to a v1 binary that doesn't recognize
+  it. Bumped `golangci-lint-action`/`golangci-lint` to the v2 line, and
+  fixed the two `staticcheck` findings that surfaced once linting could
+  actually run.
+- CI: fixed 8 `gosec` findings — unchecked errors on best-effort cleanup
+  calls (`pw.Close()`, temp plan-file removal) in `internal/runner`.
+- CI: bumped `actions/checkout`, `actions/setup-go`, `golangci-lint-action`,
+  and `gosec` off versions that targeted the now-deprecated Node.js 20
+  runner.
 
 ### Performance
 
