@@ -103,6 +103,11 @@ func TestConfirmApplyStartsStreamingAndBlocksQuit(t *testing.T) {
 		}
 	}
 
+	wantOutput := "creating...\nstill creating...\napply complete!\n"
+	if final.ApplyOutput() != wantOutput {
+		t.Fatalf("ApplyOutput() = %q, want %q", final.ApplyOutput(), wantOutput)
+	}
+
 	// Quit is allowed again now that applying has finished.
 	_, quitCmd2, _ := handleKeyQuit(final)
 	if quitCmd2 == nil {
@@ -112,6 +117,7 @@ func TestConfirmApplyStartsStreamingAndBlocksQuit(t *testing.T) {
 
 func TestApplyStreamFailureSurfacesError(t *testing.T) {
 	fake := writeFakeApplyScript(t)
+	t.Setenv("FAKE_APPLY_LINES", "creating...|Error: something went wrong")
 	t.Setenv("FAKE_APPLY_EXIT", "1")
 
 	m := NewModelWithApply(simplePlan(), "/dev/null", fake, "", "")
@@ -128,6 +134,42 @@ func TestApplyStreamFailureSurfacesError(t *testing.T) {
 	}
 	if final.applying {
 		t.Fatalf("expected applying=false once the failed stream completes")
+	}
+	// ApplyOutput must be populated even on failure -- it's the whole
+	// point: main.go prints it to the terminal before the failure
+	// message, so the detail isn't lost when the TUI's alt-screen exits.
+	wantOutput := "creating...\nError: something went wrong\n"
+	if final.ApplyOutput() != wantOutput {
+		t.Fatalf("ApplyOutput() = %q, want %q", final.ApplyOutput(), wantOutput)
+	}
+	// applyResult must stay the plain unwrapped error (not a
+	// *runner.ApplyError), so the "Apply failed: %v" text doesn't
+	// double-wrap into something like "Apply failed: terraform apply
+	// failed: exit status 1".
+	if strings.Contains(final.applyResult.Error(), "apply failed") {
+		t.Fatalf("applyResult should be unwrapped, got %q", final.applyResult.Error())
+	}
+}
+
+// The command-running banner must show the real tf command and args
+// while planning/applying, before any output has streamed in -- not
+// just a generic "Running plan..."/"Applying..." message.
+func TestConfirmationBannerShowsRealCommand(t *testing.T) {
+	m := NewModelWithApply(simplePlan(), "/dev/null", "terraform", "", "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	mm := model.(Model)
+
+	mm.applying = true
+	if got := mm.viewConfirmationPrompt(); !strings.Contains(got, "Running terraform apply") {
+		t.Fatalf("expected apply banner to show the real command, got:\n%s", got)
+	}
+	mm.applying = false
+
+	mm.planning = true
+	mm.planOptions.Cmd = "tofu"
+	mm.planOptions.Args = []string{"-target=aws_instance.foo"}
+	if got := mm.viewConfirmationPrompt(); !strings.Contains(got, "Running tofu plan -target=aws_instance.foo") {
+		t.Fatalf("expected plan banner to show the real command and args, got:\n%s", got)
 	}
 }
 

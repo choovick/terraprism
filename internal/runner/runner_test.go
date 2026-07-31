@@ -254,8 +254,16 @@ func TestApplyStreamDeliversLinesInOrderThenDoneOnSuccess(t *testing.T) {
 	}
 
 	// lines must be fully drained and closed before done fires.
-	if err := <-done; err != nil {
-		t.Errorf("expected nil error on success, got %v", err)
+	res := <-done
+	if res.Err != nil {
+		t.Errorf("expected nil error on success, got %v", res.Err)
+	}
+	if res.Result == nil {
+		t.Fatalf("expected a non-nil Result on success")
+	}
+	wantOutput := "creating...\nstill creating...\napply complete!\n"
+	if string(res.Result.Output) != wantOutput {
+		t.Errorf("Result.Output = %q, want %q", res.Result.Output, wantOutput)
 	}
 }
 
@@ -274,7 +282,7 @@ func TestApplyStreamHandlesLineLongerThanDefaultScannerLimit(t *testing.T) {
 
 	type result struct {
 		got []string
-		err error
+		res ApplyStreamResult
 	}
 	resultCh := make(chan result, 1)
 	go func() {
@@ -282,7 +290,7 @@ func TestApplyStreamHandlesLineLongerThanDefaultScannerLimit(t *testing.T) {
 		for l := range lines {
 			got = append(got, l.Text)
 		}
-		resultCh <- result{got: got, err: <-done}
+		resultCh <- result{got: got, res: <-done}
 	}()
 
 	select {
@@ -291,8 +299,8 @@ func TestApplyStreamHandlesLineLongerThanDefaultScannerLimit(t *testing.T) {
 			t.Fatalf("got %d lines (want 2); first line length %d (want %d), second line %q",
 				len(r.got), len(r.got[0]), len(longLine), r.got[len(r.got)-1])
 		}
-		if r.err != nil {
-			t.Errorf("expected nil error on success, got %v", r.err)
+		if r.res.Err != nil {
+			t.Errorf("expected nil error on success, got %v", r.res.Err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("ApplyStream did not complete within 5s -- likely hung on a line exceeding the scanner buffer")
@@ -309,8 +317,18 @@ func TestApplyStreamSurfacesNonzeroExit(t *testing.T) {
 	for range lines {
 		// drain
 	}
-	if err := <-done; err == nil {
+	res := <-done
+	if res.Err == nil {
 		t.Fatalf("expected a non-nil error for a nonzero exit")
+	}
+
+	var applyErr *ApplyError
+	if !errors.As(res.Err, &applyErr) {
+		t.Fatalf("expected an *ApplyError, got %T: %v", res.Err, res.Err)
+	}
+	wantOutput := "creating...\n"
+	if string(applyErr.Output) != wantOutput {
+		t.Errorf("ApplyError.Output = %q, want %q", applyErr.Output, wantOutput)
 	}
 }
 
@@ -324,8 +342,8 @@ func TestApplyStreamPassesAutoApprove(t *testing.T) {
 	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
 	for range lines {
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if res := <-done; res.Err != nil {
+		t.Fatalf("unexpected error: %v", res.Err)
 	}
 }
 

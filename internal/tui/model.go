@@ -48,8 +48,9 @@ type Model struct {
 	applying       bool   // apply subprocess is currently running
 	applyAttempted bool   // an apply was started at some point, regardless of outcome
 	applyResult    error  // nil until applyAttempted && !applying; nil then means success
+	applyOutput    string // captured `apply` invocation's own combined stdout+stderr output
 	applyLines     <-chan runner.ApplyLine
-	applyDone      <-chan error
+	applyDone      <-chan runner.ApplyStreamResult
 
 	// applyQuitCountdown counts down the seconds left before the TUI
 	// auto-quits after an apply finishes (success or failure); 0 means
@@ -278,6 +279,14 @@ func (m Model) ApplyResult() error {
 	return m.applyResult
 }
 
+// ApplyOutput returns the captured `apply` invocation's own combined
+// stdout+stderr output, populated once ApplyAttempted() is true and the
+// stream has finished (success or failure). Empty if apply was never
+// attempted.
+func (m Model) ApplyOutput() string {
+	return m.applyOutput
+}
+
 // Plan returns the current plan -- for a Model built via NewModelPlanning,
 // only meaningful once the program has exited and PlanErr() is nil.
 func (m Model) Plan() *tfplan.Plan {
@@ -301,6 +310,14 @@ func (m Model) PlanRawJSON() []byte {
 // if it hasn't been attempted, is still running, or succeeded.
 func (m Model) PlanErr() error {
 	return m.planErr
+}
+
+// PlanOutput returns the captured `plan` invocation's own combined
+// stdout+stderr output (populated once a NewModelPlanning run's plan
+// step has completed successfully, or as supplied directly via
+// NewModel/NewModelWithApply).
+func (m Model) PlanOutput() string {
+	return m.planOutput
 }
 
 // Init initializes the model
@@ -435,7 +452,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case applyDoneMsg:
 		m.applying = false
-		m.applyResult = msg.err
+		if msg.result != nil {
+			m.applyOutput = string(msg.result.Output)
+			m.applyResult = nil
+		} else if applyErr, ok := msg.err.(*runner.ApplyError); ok {
+			m.applyOutput = string(applyErr.Output)
+			m.applyResult = applyErr.Err
+		} else {
+			m.applyResult = msg.err
+		}
 		m.applyQuitCountdown = applyQuitCountdownStart
 		return m, tickApplyQuitCmd()
 
@@ -630,6 +655,22 @@ func (m Model) hasApplicableChanges() bool {
 	return len(m.plan.DisplayResources()) > 0
 }
 
+// planCommandLine returns the simplified tf command line to show while a
+// plan invocation runs. opts.Args already excludes internal-only flags
+// (-out=<tempfile>, -no-color) by construction, so no filtering is
+// needed here.
+func (m Model) planCommandLine() string {
+	parts := append([]string{string(m.planOptions.Cmd), "plan"}, m.planOptions.Args...)
+	return strings.Join(parts, " ")
+}
+
+// applyCommandLine returns the simplified tf command line to show while
+// an apply invocation runs. ApplyStream's other args (-auto-approve, the
+// binary plan file path) are internal plumbing, not useful to show.
+func (m Model) applyCommandLine() string {
+	return m.tfCommand + " apply"
+}
+
 // startApply confirms the apply and kicks off runner.ApplyStream as a
 // tea.Cmd -- the TUI keeps running and rendering throughout, unlike the
 // old flow where confirming apply quit the program and main.go ran
@@ -644,14 +685,17 @@ func (m Model) startApply() (Model, tea.Cmd, bool) {
 // the apply subprocess has actually started.
 type applyStreamStartedMsg struct {
 	lines <-chan runner.ApplyLine
-	done  <-chan error
+	done  <-chan runner.ApplyStreamResult
 }
 
 // applyLineMsg is one streamed line of `apply` output.
 type applyLineMsg runner.ApplyLine
 
 // applyDoneMsg reports the apply subprocess's final result.
-type applyDoneMsg struct{ err error }
+type applyDoneMsg struct {
+	result *runner.ApplyResult
+	err    error
+}
 
 // applyQuitCountdownStart is how many seconds the TUI waits after an
 // apply finishes (success or failure) before auto-quitting, unless Esc
@@ -679,12 +723,13 @@ func (m Model) startApplyCmd() tea.Cmd {
 // exhausted, the final result) and returns it as a tea.Msg; the Update
 // case handling applyLineMsg re-arms this itself, so the model keeps
 // pumping the channels one message at a time for as long as apply runs.
-func waitForApplyEvent(lines <-chan runner.ApplyLine, done <-chan error) tea.Cmd {
+func waitForApplyEvent(lines <-chan runner.ApplyLine, done <-chan runner.ApplyStreamResult) tea.Cmd {
 	return func() tea.Msg {
 		if line, ok := <-lines; ok {
 			return applyLineMsg(line)
 		}
-		return applyDoneMsg{err: <-done}
+		res := <-done
+		return applyDoneMsg{result: res.Result, err: res.Err}
 	}
 }
 
@@ -1535,7 +1580,7 @@ func (m Model) viewConfirmationPrompt() string {
 			Foreground(textColor).
 			Bold(true).
 			Padding(0, 2)
-		return "\n" + style.Render("⏳ Running plan... quit is disabled until it finishes") + "\n\n"
+		return "\n" + style.Render(fmt.Sprintf("⏳ Running %s... quit is disabled until it finishes", m.planCommandLine())) + "\n\n"
 	}
 	if m.planErr != nil {
 		style := lipgloss.NewStyle().
@@ -1551,7 +1596,7 @@ func (m Model) viewConfirmationPrompt() string {
 			Foreground(textColor).
 			Bold(true).
 			Padding(0, 2)
-		return "\n" + style.Render("⏳ Applying... quit is disabled until it finishes") + "\n\n"
+		return "\n" + style.Render(fmt.Sprintf("⏳ Running %s... quit is disabled until it finishes", m.applyCommandLine())) + "\n\n"
 	}
 	if m.applyAttempted {
 		return m.viewApplyCompletionBanner()

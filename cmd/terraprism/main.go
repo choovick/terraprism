@@ -231,9 +231,11 @@ func runApplyMode(args []string, isDestroy bool) {
 			_, _ = history.UpdateFilenameWithStatus(historyPath, history.StatusCancelled)
 		}
 	case m.ApplyResult() == nil:
+		fmt.Print(m.ApplyOutput())
 		fmt.Println("\nApply complete!")
 		updateHistoryApplyResult(historyPath, true)
 	default:
+		fmt.Print(m.ApplyOutput())
 		fmt.Fprintf(os.Stderr, "\nApply failed: %v\n", m.ApplyResult())
 		updateHistoryApplyResult(historyPath, false)
 		os.Exit(1)
@@ -295,7 +297,10 @@ func runPlanMode(args []string) {
 
 	if len(m.Plan().DisplayResources()) == 0 {
 		fmt.Println("No changes. Infrastructure is up-to-date.")
+		return
 	}
+
+	fmt.Print(m.PlanOutput())
 }
 
 // runHistoryMode handles history subcommands: list, view

@@ -249,15 +249,46 @@ type ApplyLine struct {
 	Text string
 }
 
+// ApplyResult is the outcome of a successful ApplyStream invocation.
+type ApplyResult struct {
+	Output []byte // combined stdout+stderr of the `apply` invocation itself
+}
+
+// ApplyError wraps a failed `apply` invocation, carrying the combined
+// stdout+stderr output for display exactly as the CLI produced it --
+// mirrors PlanError.
+type ApplyError struct {
+	Cmd    TFCommand
+	Output []byte
+	Err    error
+}
+
+func (e *ApplyError) Error() string {
+	return fmt.Sprintf("%s apply failed: %v", e.Cmd, e.Err)
+}
+
+func (e *ApplyError) Unwrap() error { return e.Err }
+
+// ApplyStreamResult is what ApplyStream eventually delivers on its done
+// channel: either a populated Result, or Err (always an *ApplyError).
+type ApplyStreamResult struct {
+	Result *ApplyResult
+	Err    error
+}
+
 // ApplyStream starts `<cmd> apply -auto-approve <planFile>`, merging
 // stdout and stderr into a single ordered stream of lines the way a real
 // terminal would (one process, one pipe, genuine OS-level interleaving),
 // and returns immediately once the subprocess has started. Lines arrive
-// on the returned channel as they're produced; exactly one value (nil on
-// success) is sent on the done channel once the process exits, after
-// which both channels are closed. lines is always fully drained and
-// closed before done fires, so a caller doing `for range lines` and then
-// reading done never misses trailing output.
+// on the returned channel as they're produced; lines is always fully
+// drained and closed before exactly one ApplyStreamResult is sent on
+// done, after which done is closed too -- so a caller doing `for range
+// lines` and then reading done never misses trailing output.
+//
+// ApplyStreamResult carries the same combined stdout+stderr output
+// either way (on Result for success, on Err's *ApplyError for failure),
+// so a caller can show/print the full apply output after the fact
+// without having accumulated it line-by-line itself.
 //
 // -auto-approve is required: unlike Apply, ApplyStream does not connect
 // the subprocess's stdin to the terminal (the caller, e.g. a running
@@ -267,9 +298,9 @@ type ApplyLine struct {
 //
 // internal/runner takes no UI-framework dependency: pumping lines/done
 // into an event loop (e.g. a Bubble Tea tea.Cmd) is the caller's job.
-func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan ApplyLine, <-chan error) {
+func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan ApplyLine, <-chan ApplyStreamResult) {
 	lines := make(chan ApplyLine, 64)
-	done := make(chan error, 1)
+	done := make(chan ApplyStreamResult, 1)
 
 	applyCmd := exec.CommandContext(ctx, string(cmd), "apply", "-auto-approve", planFile)
 	pr, pw := io.Pipe()
@@ -279,7 +310,7 @@ func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan Ap
 	if err := applyCmd.Start(); err != nil {
 		_ = pw.Close()
 		close(lines)
-		done <- err
+		done <- ApplyStreamResult{Err: &ApplyError{Cmd: cmd, Err: err}}
 		close(done)
 		return lines, done
 	}
@@ -291,12 +322,22 @@ func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan Ap
 	}()
 
 	go func() {
+		var output bytes.Buffer
 		scanner := newOutputScanner(pr)
 		for scanner.Scan() {
-			lines <- ApplyLine{Text: scanner.Text()}
+			text := scanner.Text()
+			output.WriteString(text)
+			output.WriteByte('\n')
+			lines <- ApplyLine{Text: text}
 		}
 		close(lines)
-		done <- <-waitErr
+
+		if err := <-waitErr; err != nil {
+			done <- ApplyStreamResult{Err: &ApplyError{Cmd: cmd, Output: output.Bytes(), Err: err}}
+			close(done)
+			return
+		}
+		done <- ApplyStreamResult{Result: &ApplyResult{Output: output.Bytes()}}
 		close(done)
 	}()
 
