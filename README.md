@@ -379,6 +379,13 @@ terraprism history list --clear      # Delete all history files
 
 History is automatically cleaned up when exceeding 100 files (oldest removed first).
 
+`plan`/`apply` also briefly write a binary plan file (`terraprism-*.tfplan`)
+into the same `~/.terraprism/` directory — it's not a history entry (only
+`.json` files show up in `history list`/`view`) and is removed
+automatically once the run finishes. If a run is ever killed before it
+can clean up after itself, any leftover `.tfplan` file older than 5 hours
+is swept the next time you run `plan` or `apply`.
+
 ## Why Terra-Prism?
 
 Large Terraform plans can be difficult to review:

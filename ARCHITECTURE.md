@@ -44,7 +44,7 @@ flowchart TD
 
     runner["internal/runner<br/><i>shells out to terraform/tofu;<br/>plan and apply both stream live</i>"]
     tfplan["internal/tfplan<br/><i>decodes show -json into a<br/>pre-diffed Attribute tree</i>"]
-    history["internal/history<br/><i>JSON envelope files<br/>in ~/.terraprism/</i>"]
+    history["internal/history<br/><i>JSON envelope files +<br/>interim .tfplan files<br/>in ~/.terraprism/</i>"]
     tui["internal/tui<br/><i>Bubble Tea interactive TUI +<br/>non-interactive print mode</i>"]
     foldtree["internal/foldtree<br/><i>generic TUI toolkit: tree nav,<br/>rendering, search, pickers, log pane</i>"]
     updater["internal/updater<br/><i>GitHub release<br/>self-update</i>"]
@@ -57,6 +57,7 @@ flowchart TD
     demo --> foldtree
 
     runner --> tfplan
+    runner --> history
     tui --> tfplan
     tui --> runner
     tui --> history
@@ -68,9 +69,9 @@ flowchart TD
 |---|---|---|
 | `cmd/terraprism` | Parses CLI args, dispatches to one of the run modes below, owns the "no changes" early exits and history bookkeeping | `history`, `runner`, `tfplan`, `tui`, `updater` |
 | `cmd/foldtree-demo` | Interactive playground exercising `internal/foldtree` directly against synthetic sample trees, independent of any plan data — for trying navigation feel in isolation | `foldtree` |
-| `internal/runner` | The **only** place that invokes the real `terraform`/`tofu` binary; `PlanStream`/`ApplyStream` stream output live over a channel instead of taking over the terminal, with `RunPlan` as a thin synchronous wrapper over `PlanStream` | `tfplan` |
+| `internal/runner` | The **only** place that invokes the real `terraform`/`tofu` binary; `PlanStream`/`ApplyStream` stream output live over a channel instead of taking over the terminal, with `RunPlan` as a thin synchronous wrapper over `PlanStream`; the interim binary plan file it writes lives in `history`'s directory and is swept by `history`'s stale-file cleanup rather than a mechanism of its own | `tfplan`, `history` |
 | `internal/tfplan` | Decodes `terraform show -json` via `hashicorp/terraform-json`, builds the pre-diffed `Attribute` tree, exposes plan-wide summary counts | *(none — leaf package)* |
-| `internal/history` | Persists/lists/renames plan & apply runs as JSON envelope files | *(none)* |
+| `internal/history` | Persists/lists/renames plan & apply runs as JSON envelope files, and owns `~/.terraprism/` as the one directory both history files and `runner`'s interim `.tfplan` files live in | *(none)* |
 | `internal/tui` | Renders a `*tfplan.Plan` — either interactively (Bubble Tea `Model`) or flat (`PrintPlan`) — and, for `plan`/`apply`/`destroy`, drives `internal/runner`'s streaming functions itself from inside the running program | `tfplan`, `runner`, `history` (picker only), `updater` (update nudge), `foldtree` (navigation, rendering, search, pickers, log pane) |
 | `internal/foldtree` | A generic, plan-agnostic TUI toolkit, not just navigation: `State` (cursor+scroll+collapse), `TreeView` (a full render+search `tea.Model` built on `State`), `Picker[T]` (a generic picker overlay), `LogPane` (an autoscrolling, searchable text pane), and `SplitView` (a primary+auxiliary pane compositor) | *(none — leaf package)* |
 | `internal/updater` | Checks GitHub Releases for newer versions and self-updates the binary | *(none)* |
@@ -114,7 +115,7 @@ file(s) they test where the mapping is obvious.
 
 ### `internal/runner/`
 
-- **`runner.go`** — Shells out to `terraform`/`tofu`: `RunPlan` (synchronous, wraps `PlanStream`), `PlanStream` (streams `plan` output then decodes via `show -json`), `ApplyStream` (streams `apply -auto-approve` output), and `DetectCommand`.
+- **`runner.go`** — Shells out to `terraform`/`tofu`: `RunPlan` (synchronous, wraps `PlanStream`), `PlanStream` (streams `plan` output then decodes via `show -json`), `ApplyStream` (streams `apply -auto-approve` output), and `DetectCommand`. `reserveTempPlanFile` writes the interim binary plan file into `history.EnsureHistoryDir()` (i.e. `~/.terraprism/`, not the OS temp directory) and best-effort sweeps stale ones via `history.CleanupStalePlanFiles()` before creating a new one.
 - **`runner_test.go`** — Drives all of the above against a stand-in shell script (`Options.Cmd` is just an executable path) instead of shimming `PATH`.
 
 ### `internal/tfplan/`
@@ -128,7 +129,7 @@ file(s) they test where the mapping is obvious.
 
 ### `internal/history/`
 
-- **`history.go`** — Persists/lists/renames plan & apply runs as JSON envelope files under `~/.terraprism/`.
+- **`history.go`** — Persists/lists/renames plan & apply runs as JSON envelope files under `~/.terraprism/`; `CleanupOldFiles` count-caps `.json` history at `MaxHistoryFiles`, while `CleanupStalePlanFiles` separately age-sweeps orphaned `.tfplan` files (see `internal/runner`) older than 5 hours — a backstop for a process that was killed before it could remove its own plan file, never a concurrent session's still-in-progress one.
 - **`history_test.go`** — Tests against a `$HOME` redirected to `t.TempDir()`.
 
 ### `internal/updater/`
@@ -191,9 +192,13 @@ blocked for the whole duration of a plan or apply, so `main.go`'s
 plan-file cleanup can never race a subprocess that's still running.
 
 The binary plan file is always written first (`show -json` requires one —
-there's no way to get JSON plan output without it). The raw JSON bytes
-(not the parsed Go struct) are what get persisted to history, so history
-stays re-decodable by any future version of `tfplan.Decode`.
+there's no way to get JSON plan output without it), into `~/.terraprism/`
+via `history.EnsureHistoryDir()` rather than the OS temp directory, so
+everything terraprism writes to disk lives in one place; a `.tfplan` file
+there is invisible to `terraprism history` since that only ever looks at
+`.json` files. The raw JSON bytes (not the parsed Go struct) are what get
+persisted to history, so history stays re-decodable by any future version
+of `tfplan.Decode`.
 
 ```mermaid
 sequenceDiagram
@@ -208,10 +213,12 @@ sequenceDiagram
     Main->>TUI: NewModelPlanning(opts, applyMode=true)
     TUI-->>User: TUI opens immediately, empty tree, output pane visible
     TUI->>Runner: PlanStream(opts) (kicked off from Init())
-    Runner->>TF: plan -out=tmp.tfplan -no-color
+    Runner->>Hist: EnsureHistoryDir() + CleanupStalePlanFiles()
+    Hist-->>Runner: ~/.terraprism/terraprism-<rand>.tfplan
+    Runner->>TF: plan -out=~/.terraprism/terraprism-<rand>.tfplan -no-color
     TF-->>Runner: stdout/stderr, line by line
     Runner-->>TUI: PlanLine (streamed live into the output pane)
-    Runner->>TF: show -json tmp.tfplan (not itself streamed)
+    Runner->>TF: show -json ~/.terraprism/terraprism-<rand>.tfplan (not itself streamed)
     TF-->>Runner: JSON bytes, decoded to *tfplan.Plan
     Runner-->>TUI: PlanStreamResult{Result, nil}
     TUI-->>User: tree populated, output pane auto-hides (still reachable via 'o')
