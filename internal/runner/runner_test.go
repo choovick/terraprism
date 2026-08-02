@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/CaptShanks/terraprism/internal/history"
 )
 
 const fakeTFScript = `#!/bin/sh
@@ -68,6 +70,7 @@ func writeFakeTF(t *testing.T) string {
 }
 
 func TestRunPlanSuccess(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_TF_SHOW_STDOUT", validPlanJSON)
 	t.Setenv("FAKE_TF_PLAN_STDOUT", "Plan: 1 to add, 0 to change, 0 to destroy.\n")
 	fake := writeFakeTF(t)
@@ -91,6 +94,7 @@ func TestRunPlanSuccess(t *testing.T) {
 }
 
 func TestRunPlanKeepsPlanFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_TF_SHOW_STDOUT", validPlanJSON)
 	fake := writeFakeTF(t)
 
@@ -108,6 +112,7 @@ func TestRunPlanKeepsPlanFile(t *testing.T) {
 }
 
 func TestRunPlanFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_TF_PLAN_EXIT", "1")
 	t.Setenv("FAKE_TF_PLAN_STDOUT", "Error: something went wrong\n")
 	fake := writeFakeTF(t)
@@ -126,6 +131,7 @@ func TestRunPlanFailure(t *testing.T) {
 }
 
 func TestRunPlanShowFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_TF_SHOW_EXIT", "1")
 	t.Setenv("FAKE_TF_SHOW_STDERR", "Error: show failed\n")
 	fake := writeFakeTF(t)
@@ -144,6 +150,7 @@ func TestRunPlanShowFailure(t *testing.T) {
 }
 
 func TestRunPlanInvalidJSON(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_TF_SHOW_STDOUT", "not json")
 	fake := writeFakeTF(t)
 
@@ -154,11 +161,20 @@ func TestRunPlanInvalidJSON(t *testing.T) {
 }
 
 func TestPlanStreamDeliversLinesThenSucceeds(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_TF_PLAN_LINES", "reading state...|refreshing...|plan generated")
 	t.Setenv("FAKE_TF_SHOW_STDOUT", validPlanJSON)
 	fake := writeFakeTF(t)
 
-	lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake)})
+	cmdLine, lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake), Args: []string{"-target=null_resource.x"}})
+
+	wantPrefix := fake + " plan -out=" // the generated tempfile path itself is non-deterministic
+	if !strings.HasPrefix(cmdLine, wantPrefix) {
+		t.Errorf("cmdLine = %q, want prefix %q", cmdLine, wantPrefix)
+	}
+	if !strings.HasSuffix(cmdLine, " -no-color -target=null_resource.x") {
+		t.Errorf("cmdLine = %q, want suffix %q", cmdLine, " -no-color -target=null_resource.x")
+	}
 
 	var got []string
 	for l := range lines {
@@ -191,11 +207,12 @@ func TestPlanStreamDeliversLinesThenSucceeds(t *testing.T) {
 }
 
 func TestPlanStreamSurfacesPlanFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_TF_PLAN_LINES", "reading state...|Error: something went wrong")
 	t.Setenv("FAKE_TF_PLAN_EXIT", "1")
 	fake := writeFakeTF(t)
 
-	lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake)})
+	_, lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake)})
 	for range lines {
 	}
 	res := <-done
@@ -214,10 +231,11 @@ func TestPlanStreamSurfacesPlanFailure(t *testing.T) {
 }
 
 func TestPlanStreamKeepsPlanFileOnSuccess(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_TF_SHOW_STDOUT", validPlanJSON)
 	fake := writeFakeTF(t)
 
-	lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake), KeepPlanFile: true})
+	_, lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake), KeepPlanFile: true})
 	for range lines {
 	}
 	res := <-done
@@ -233,11 +251,39 @@ func TestPlanStreamKeepsPlanFileOnSuccess(t *testing.T) {
 	}
 }
 
+func TestReserveTempPlanFileUsesHistoryDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("FAKE_TF_SHOW_STDOUT", validPlanJSON)
+	fake := writeFakeTF(t)
+
+	_, lines, done := PlanStream(context.Background(), Options{Cmd: TFCommand(fake), KeepPlanFile: true})
+	for range lines {
+	}
+	res := <-done
+	if res.Err != nil {
+		t.Fatalf("unexpected error: %v", res.Err)
+	}
+	defer os.Remove(res.Result.PlanFile)
+
+	wantDir, err := history.GetHistoryDir()
+	if err != nil {
+		t.Fatalf("history.GetHistoryDir: %v", err)
+	}
+	if gotDir := filepath.Dir(res.Result.PlanFile); gotDir != wantDir {
+		t.Errorf("plan file dir = %q, want %q", gotDir, wantDir)
+	}
+}
+
 func TestApplyStreamDeliversLinesInOrderThenDoneOnSuccess(t *testing.T) {
 	t.Setenv("FAKE_TF_APPLY_LINES", "creating...|still creating...|apply complete!")
 	fake := writeFakeTF(t)
 
-	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+	cmdLine, lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+
+	wantCmdLine := fake + " apply -auto-approve /dev/null"
+	if cmdLine != wantCmdLine {
+		t.Errorf("cmdLine = %q, want %q", cmdLine, wantCmdLine)
+	}
 
 	var got []string
 	for l := range lines {
@@ -278,7 +324,7 @@ func TestApplyStreamHandlesLineLongerThanDefaultScannerLimit(t *testing.T) {
 	t.Setenv("FAKE_TF_APPLY_LINES", longLine+"|apply complete!")
 	fake := writeFakeTF(t)
 
-	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+	_, lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
 
 	type result struct {
 		got []string
@@ -312,7 +358,7 @@ func TestApplyStreamSurfacesNonzeroExit(t *testing.T) {
 	t.Setenv("FAKE_TF_APPLY_EXIT", "1")
 	fake := writeFakeTF(t)
 
-	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+	_, lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
 
 	for range lines {
 		// drain
@@ -339,7 +385,7 @@ func TestApplyStreamPassesAutoApprove(t *testing.T) {
 	// reject an interactive-approval flow otherwise, since ApplyStream
 	// never connects the subprocess's stdin to a terminal.
 	fake := writeFakeTF(t)
-	lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
+	_, lines, done := ApplyStream(context.Background(), TFCommand(fake), "/dev/null")
 	for range lines {
 	}
 	if res := <-done; res.Err != nil {

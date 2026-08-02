@@ -29,6 +29,18 @@ const (
 	MaxHistoryFiles = 100
 
 	fileExt = ".json"
+
+	// stalePlanFileAge is how old an orphaned interim plan file has to be
+	// before CleanupStalePlanFiles removes it. terraprism can run multiple
+	// sessions in parallel, each with its own plan file live in
+	// ~/.terraprism/ at the same time, so this only ever removes files far
+	// older than any realistic single plan/apply review session -- a
+	// concurrent session's own in-progress file is always much younger and
+	// is never at risk. A normal plan/apply cycle finishes in minutes and
+	// always cleans up its own plan file either way; this is a backstop
+	// for the one case code can't guarantee against -- a hard kill
+	// (SIGKILL) that skips cleanup entirely.
+	stalePlanFileAge = 5 * time.Hour
 )
 
 // Entry represents a history file entry
@@ -286,6 +298,42 @@ func CleanupOldFiles() (int, error) {
 		}
 	}
 
+	return deleted, nil
+}
+
+// CleanupStalePlanFiles removes any interim binary plan file
+// (terraform plan -out=<this>) left behind in the history directory by
+// a process that was killed before it could clean up after itself.
+// Safe to call on every new plan invocation (see internal/runner) --
+// most of the time there's nothing to remove.
+func CleanupStalePlanFiles() (int, error) {
+	dir, err := GetHistoryDir()
+	if err != nil {
+		return 0, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	cutoff := time.Now().Add(-stalePlanFileAge)
+	deleted := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "terraprism-") || !strings.HasSuffix(name, ".tfplan") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err == nil {
+			deleted++
+		}
+	}
 	return deleted, nil
 }
 

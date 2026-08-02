@@ -39,6 +39,7 @@ type Model struct {
 	planErr     error
 	planLines   <-chan runner.PlanLine
 	planDone    <-chan runner.PlanStreamResult
+	planCmdLine string // the exact `plan` command invoked, once known (see PlanStream); "" until then
 
 	// Apply mode fields
 	applyMode      bool   // Whether apply is available
@@ -49,6 +50,7 @@ type Model struct {
 	applyAttempted bool   // an apply was started at some point, regardless of outcome
 	applyResult    error  // nil until applyAttempted && !applying; nil then means success
 	applyOutput    string // captured `apply` invocation's own combined stdout+stderr output
+	applyCmdLine   string // the exact `apply` command invoked, once known (see ApplyStream); "" until then
 	applyLines     <-chan runner.ApplyLine
 	applyDone      <-chan runner.ApplyStreamResult
 
@@ -439,6 +441,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case applyStreamStartedMsg:
 		m.applyAttempted = true
+		m.applyCmdLine = msg.cmdLine
 		m.applyLines = msg.lines
 		m.applyDone = msg.done
 		m.outputPane.Reset()
@@ -475,6 +478,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickApplyQuitCmd()
 
 	case planStreamStartedMsg:
+		m.planCmdLine = msg.cmdLine
 		m.planLines = msg.lines
 		m.planDone = msg.done
 		return m, waitForPlanEvent(msg.lines, msg.done)
@@ -655,19 +659,27 @@ func (m Model) hasApplicableChanges() bool {
 	return len(m.plan.DisplayResources()) > 0
 }
 
-// planCommandLine returns the simplified tf command line to show while a
-// plan invocation runs. opts.Args already excludes internal-only flags
-// (-out=<tempfile>, -no-color) by construction, so no filtering is
-// needed here.
+// planCommandLine returns the exact `plan` command PlanStream invoked
+// (planCmdLine, populated once planStreamStartedMsg arrives), or a
+// simplified guess (tf command + "plan" + the user's own extra args,
+// omitting internal-only flags like -out=<tempfile>/-no-color since
+// they aren't known yet) for the brief window before that -- the very
+// first render frame, before the subprocess has actually started.
 func (m Model) planCommandLine() string {
+	if m.planCmdLine != "" {
+		return m.planCmdLine
+	}
 	parts := append([]string{string(m.planOptions.Cmd), "plan"}, m.planOptions.Args...)
 	return strings.Join(parts, " ")
 }
 
-// applyCommandLine returns the simplified tf command line to show while
-// an apply invocation runs. ApplyStream's other args (-auto-approve, the
-// binary plan file path) are internal plumbing, not useful to show.
+// applyCommandLine returns the exact `apply` command ApplyStream
+// invoked (applyCmdLine, populated once applyStreamStartedMsg arrives),
+// or a simplified "<cmd> apply" guess for the brief window before that.
 func (m Model) applyCommandLine() string {
+	if m.applyCmdLine != "" {
+		return m.applyCmdLine
+	}
 	return m.tfCommand + " apply"
 }
 
@@ -684,8 +696,9 @@ func (m Model) startApply() (Model, tea.Cmd, bool) {
 // applyStreamStartedMsg carries the channels ApplyStream returns, once
 // the apply subprocess has actually started.
 type applyStreamStartedMsg struct {
-	lines <-chan runner.ApplyLine
-	done  <-chan runner.ApplyStreamResult
+	cmdLine string
+	lines   <-chan runner.ApplyLine
+	done    <-chan runner.ApplyStreamResult
 }
 
 // applyLineMsg is one streamed line of `apply` output.
@@ -714,8 +727,8 @@ func tickApplyQuitCmd() tea.Cmd {
 func (m Model) startApplyCmd() tea.Cmd {
 	tfCommand, planFile := m.tfCommand, m.planFile
 	return func() tea.Msg {
-		lines, done := runner.ApplyStream(context.Background(), runner.TFCommand(tfCommand), planFile)
-		return applyStreamStartedMsg{lines: lines, done: done}
+		cmdLine, lines, done := runner.ApplyStream(context.Background(), runner.TFCommand(tfCommand), planFile)
+		return applyStreamStartedMsg{cmdLine: cmdLine, lines: lines, done: done}
 	}
 }
 
@@ -736,8 +749,9 @@ func waitForApplyEvent(lines <-chan runner.ApplyLine, done <-chan runner.ApplySt
 // planStreamStartedMsg carries the channels PlanStream returns, once the
 // plan subprocess has actually started.
 type planStreamStartedMsg struct {
-	lines <-chan runner.PlanLine
-	done  <-chan runner.PlanStreamResult
+	cmdLine string
+	lines   <-chan runner.PlanLine
+	done    <-chan runner.PlanStreamResult
 }
 
 // planLineMsg is one streamed line of `plan` output.
@@ -753,8 +767,8 @@ type planDoneMsg struct {
 func (m Model) startPlanCmd() tea.Cmd {
 	opts := m.planOptions
 	return func() tea.Msg {
-		lines, done := runner.PlanStream(context.Background(), opts)
-		return planStreamStartedMsg{lines: lines, done: done}
+		cmdLine, lines, done := runner.PlanStream(context.Background(), opts)
+		return planStreamStartedMsg{cmdLine: cmdLine, lines: lines, done: done}
 	}
 }
 
@@ -1569,6 +1583,18 @@ func (m Model) viewSortStatus() string {
 	return searchStyle.Render(fmt.Sprintf("Sort: %s • s: change", sortOrderLabel(order))) + "\n\n"
 }
 
+// bannerWidth returns the width available for a status banner's text,
+// leaving room for the style's own horizontal padding, so long content
+// (e.g. a full plan/apply command line) word-wraps onto multiple lines
+// instead of being clipped by the terminal's right edge.
+func (m Model) bannerWidth() int {
+	w := m.width - 4
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
 // viewConfirmationPrompt renders the apply confirmation prompt, or (once
 // confirmed) a status banner for as long as the apply subprocess is
 // still running -- mutually exclusive with each other and with the
@@ -1579,15 +1605,17 @@ func (m Model) viewConfirmationPrompt() string {
 			Background(updateColor).
 			Foreground(textColor).
 			Bold(true).
-			Padding(0, 2)
-		return "\n" + style.Render(fmt.Sprintf("⏳ Running %s... quit is disabled until it finishes", m.planCommandLine())) + "\n\n"
+			Padding(0, 2).
+			Width(m.bannerWidth())
+		return "\n" + style.Render(fmt.Sprintf("⏳ Running %s (quit disabled until it finishes)", m.planCommandLine())) + "\n\n"
 	}
 	if m.planErr != nil {
 		style := lipgloss.NewStyle().
 			Background(destroyColor).
 			Foreground(textColor).
 			Bold(true).
-			Padding(0, 2)
+			Padding(0, 2).
+			Width(m.bannerWidth())
 		return "\n" + style.Render(fmt.Sprintf("✗ Plan failed: %v", m.planErr)) + "\n\n"
 	}
 	if m.applying {
@@ -1595,8 +1623,9 @@ func (m Model) viewConfirmationPrompt() string {
 			Background(updateColor).
 			Foreground(textColor).
 			Bold(true).
-			Padding(0, 2)
-		return "\n" + style.Render(fmt.Sprintf("⏳ Running %s... quit is disabled until it finishes", m.applyCommandLine())) + "\n\n"
+			Padding(0, 2).
+			Width(m.bannerWidth())
+		return "\n" + style.Render(fmt.Sprintf("⏳ Running %s (quit disabled until it finishes)", m.applyCommandLine())) + "\n\n"
 	}
 	if m.applyAttempted {
 		return m.viewApplyCompletionBanner()
@@ -1608,7 +1637,8 @@ func (m Model) viewConfirmationPrompt() string {
 		Background(destroyColor).
 		Foreground(textColor).
 		Bold(true).
-		Padding(0, 2)
+		Padding(0, 2).
+		Width(m.bannerWidth())
 	return "\n" + confirmStyle.Render("⚠️  Apply this plan? Press 'y' to confirm, any other key to cancel") + "\n\n"
 }
 
@@ -1633,7 +1663,8 @@ func (m Model) viewApplyCompletionBanner() string {
 		Background(bg).
 		Foreground(textColor).
 		Bold(true).
-		Padding(0, 2)
+		Padding(0, 2).
+		Width(m.bannerWidth())
 	return "\n" + style.Render(msg) + "\n\n"
 }
 

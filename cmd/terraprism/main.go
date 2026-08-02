@@ -205,12 +205,16 @@ func runApplyMode(args []string, isDestroy bool) {
 	if !ok {
 		return // unreachable: finalModel is always the tui.Model this function built
 	}
-	if planFile := m.PlanFile(); planFile != "" {
+	planFile := m.PlanFile()
+	if planFile != "" {
 		defer os.Remove(planFile)
 	}
 
 	if err := m.PlanErr(); err != nil {
 		reportRunError(tfCmd, err)
+		if planFile != "" {
+			_ = os.Remove(planFile) // os.Exit below skips the deferred cleanup above
+		}
 		os.Exit(1)
 	}
 
@@ -238,6 +242,9 @@ func runApplyMode(args []string, isDestroy bool) {
 		fmt.Print(m.ApplyOutput())
 		fmt.Fprintf(os.Stderr, "\nApply failed: %v\n", m.ApplyResult())
 		updateHistoryApplyResult(historyPath, false)
+		if planFile != "" {
+			_ = os.Remove(planFile) // os.Exit below skips the deferred cleanup above
+		}
 		os.Exit(1)
 	}
 }

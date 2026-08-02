@@ -184,6 +184,63 @@ func TestUpdateFilenameWithStatus(t *testing.T) {
 	}
 }
 
+func TestCleanupStalePlanFilesRemovesOldOnesKeepsFreshOnes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir, err := EnsureHistoryDir()
+	if err != nil {
+		t.Fatalf("EnsureHistoryDir: %v", err)
+	}
+
+	oldPlan := filepath.Join(dir, "terraprism-old.tfplan")
+	freshPlan := filepath.Join(dir, "terraprism-fresh.tfplan")
+	oldJSON := filepath.Join(dir, "2020-01-01_10-00-00_myproj_plan.json")
+
+	for _, p := range []string{oldPlan, freshPlan, oldJSON} {
+		if err := os.WriteFile(p, []byte("data"), 0644); err != nil {
+			t.Fatalf("writing %s: %v", p, err)
+		}
+	}
+
+	staleTime := time.Now().Add(-6 * time.Hour)
+	if err := os.Chtimes(oldPlan, staleTime, staleTime); err != nil {
+		t.Fatalf("Chtimes oldPlan: %v", err)
+	}
+	if err := os.Chtimes(oldJSON, staleTime, staleTime); err != nil {
+		t.Fatalf("Chtimes oldJSON: %v", err)
+	}
+
+	deleted, err := CleanupStalePlanFiles()
+	if err != nil {
+		t.Fatalf("CleanupStalePlanFiles: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+
+	if _, err := os.Stat(oldPlan); !os.IsNotExist(err) {
+		t.Errorf("old plan file should have been removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(freshPlan); err != nil {
+		t.Errorf("fresh plan file should still exist: %v", err)
+	}
+	if _, err := os.Stat(oldJSON); err != nil {
+		t.Errorf("old .json history file should not be touched: %v", err)
+	}
+}
+
+func TestCleanupStalePlanFilesNoOpWhenDirMissing(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	deleted, err := CleanupStalePlanFiles()
+	if err != nil {
+		t.Fatalf("CleanupStalePlanFiles: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0", deleted)
+	}
+}
+
 func TestListEntriesIgnoresNonJSONFiles(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 

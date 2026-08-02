@@ -151,10 +151,12 @@ func TestApplyStreamFailureSurfacesError(t *testing.T) {
 	}
 }
 
-// The command-running banner must show the real tf command and args
-// while planning/applying, before any output has streamed in -- not
-// just a generic "Running plan..."/"Applying..." message.
-func TestConfirmationBannerShowsRealCommand(t *testing.T) {
+// Before the subprocess has actually started (so the exact command,
+// including the generated -out=<tempfile> path, isn't known yet), the
+// banner falls back to a simplified guess built from what's already
+// known at construction time -- still real and specific, not a generic
+// "Running plan..."/"Applying..." message.
+func TestConfirmationBannerFallsBackToSimplifiedCommandBeforeStreamStarts(t *testing.T) {
 	m := NewModelWithApply(simplePlan(), "/dev/null", "terraform", "", "")
 	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	mm := model.(Model)
@@ -170,6 +172,60 @@ func TestConfirmationBannerShowsRealCommand(t *testing.T) {
 	mm.planOptions.Args = []string{"-target=aws_instance.foo"}
 	if got := mm.viewConfirmationPrompt(); !strings.Contains(got, "Running tofu plan -target=aws_instance.foo") {
 		t.Fatalf("expected plan banner to show the real command and args, got:\n%s", got)
+	}
+}
+
+// Once the subprocess has actually started, the banner upgrades to the
+// exact literal command invoked -- including internal-only flags like
+// -out=<tempfile>/-no-color/-auto-approve -- not just the simplified
+// pre-start guess.
+func TestConfirmationBannerShowsLiteralCommandOnceStreamStarts(t *testing.T) {
+	m := NewModelWithApply(simplePlan(), "/dev/null", "terraform", "", "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	mm := model.(Model)
+
+	mm.applying = true
+	mm.applyCmdLine = "terraform apply -auto-approve /dev/null"
+	if got := mm.viewConfirmationPrompt(); !strings.Contains(got, "Running terraform apply -auto-approve /dev/null") {
+		t.Fatalf("expected apply banner to show the literal command, got:\n%s", got)
+	}
+	mm.applying = false
+
+	mm.planning = true
+	mm.planCmdLine = "tofu plan -out=/tmp/terraprism-123.tfplan -no-color -target=aws_instance.foo"
+	if got := mm.viewConfirmationPrompt(); !strings.Contains(got, "Running "+mm.planCmdLine) {
+		t.Fatalf("expected plan banner to show the literal command, got:\n%s", got)
+	}
+}
+
+// A long command line (the realistic case, once the generated
+// -out=<tempfile> path is included) must word-wrap onto multiple lines
+// in a narrow terminal rather than being clipped by the terminal's
+// right edge -- the full text must still be present somewhere in the
+// banner, just spread across lines. lipgloss's Width()-driven wrap can
+// break mid-token (e.g. inside "-out=") rather than only at spaces, so
+// the comparison strips all whitespace from both sides instead of
+// assuming wrap points land on the original string's own space
+// boundaries.
+func TestConfirmationBannerWordWrapsLongCommandInNarrowTerminal(t *testing.T) {
+	m := NewModelWithApply(simplePlan(), "/dev/null", "terraform", "", "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 30})
+	mm := model.(Model)
+
+	mm.planning = true
+	mm.planCmdLine = "tofu plan -out=/tmp/terraprism-987654321.tfplan -no-color -target=aws_instance.a_very_long_resource_name"
+	got := stripRenderANSI(mm.viewConfirmationPrompt())
+
+	lines := strings.Split(strings.Trim(got, "\n"), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected the long command to wrap onto multiple lines in a %d-wide terminal, got %d line(s):\n%s", mm.width, len(lines), got)
+	}
+
+	squash := func(s string) string {
+		return strings.Join(strings.Fields(s), "")
+	}
+	if !strings.Contains(squash(got), squash(mm.planCmdLine)) {
+		t.Fatalf("expected the full command text to survive wrapping (not be truncated), got:\n%s", got)
 	}
 }
 

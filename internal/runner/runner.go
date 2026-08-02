@@ -11,7 +11,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 
+	"github.com/CaptShanks/terraprism/internal/history"
 	"github.com/CaptShanks/terraprism/internal/tfplan"
 )
 
@@ -103,7 +105,7 @@ func (e *ShowError) Unwrap() error { return e.Err }
 // progress gets identical behavior/output to one that does, by
 // construction rather than by keeping two implementations in sync.
 func RunPlan(ctx context.Context, opts Options) (*PlanResult, error) {
-	lines, done := PlanStream(ctx, opts)
+	_, lines, done := PlanStream(ctx, opts)
 	for range lines {
 	}
 	res := <-done
@@ -124,13 +126,21 @@ type PlanStreamResult struct {
 }
 
 // reserveTempPlanFile creates and immediately closes a uniquely-named
-// temp file, returning its path for `plan -out=` to write into. Using
-// os.CreateTemp's atomic O_EXCL creation (rather than a name derived
-// only from os.Getpid, which the OS can reuse across processes) rules
-// out a stale leftover from a killed/crashed process ever colliding
-// with a later run.
+// plan file in the same directory internal/history manages
+// (~/.terraprism/), returning its path for `plan -out=` to write into.
+// Using os.CreateTemp's atomic O_EXCL creation (rather than a name
+// derived only from os.Getpid, which the OS can reuse across processes)
+// rules out a stale leftover ever colliding with a later run. A
+// .tfplan file here is automatically invisible to `terraprism history
+// list`/`view`, which only ever look at .json files.
 func reserveTempPlanFile() (string, error) {
-	f, err := os.CreateTemp("", "terraprism-*.tfplan")
+	dir, err := history.EnsureHistoryDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving history directory: %w", err)
+	}
+	_, _ = history.CleanupStalePlanFiles() // best-effort; a failed sweep must never block creating a new plan file
+
+	f, err := os.CreateTemp(dir, "terraprism-*.tfplan")
 	if err != nil {
 		return "", err
 	}
@@ -149,26 +159,32 @@ func reserveTempPlanFile() (string, error) {
 // exactly one PlanStreamResult is sent on done, after which done is
 // closed too.
 //
+// The returned cmdLine is the exact command invoked (including the
+// generated -out=<tempfile> path), for a caller that wants to show the
+// user what's actually running; it's "" only if reserveTempPlanFile
+// itself failed, before any command could be constructed.
+//
 // If `plan` itself succeeds, PlanStream goes on to run `<cmd> show
 // -json` (fast and not itself streamed — it's a single JSON blob, not
 // line-oriented progress) and decode it before signaling done, so a
 // successful PlanStreamResult always carries a fully-decoded Plan ready
 // to display; a caller never sees "done" without either a usable Plan or
 // an error explaining why not.
-func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan PlanStreamResult) {
-	lines := make(chan PlanLine, 64)
-	done := make(chan PlanStreamResult, 1)
+func PlanStream(ctx context.Context, opts Options) (cmdLine string, lines <-chan PlanLine, done <-chan PlanStreamResult) {
+	linesCh := make(chan PlanLine, 64)
+	doneCh := make(chan PlanStreamResult, 1)
 
 	planFile, err := reserveTempPlanFile()
 	if err != nil {
-		close(lines)
-		done <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Err: fmt.Errorf("creating temp plan file: %w", err)}}
-		close(done)
-		return lines, done
+		close(linesCh)
+		doneCh <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Err: fmt.Errorf("creating temp plan file: %w", err)}}
+		close(doneCh)
+		return "", linesCh, doneCh
 	}
 	planArgs := append([]string{"plan", "-out=" + planFile, "-no-color"}, opts.Args...)
 	planCmd := exec.CommandContext(ctx, string(opts.Cmd), planArgs...)
 	planCmd.Dir = opts.Dir
+	cmdLine = strings.Join(planCmd.Args, " ")
 
 	pr, pw := io.Pipe()
 	planCmd.Stdout = pw
@@ -176,10 +192,10 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 
 	if err := planCmd.Start(); err != nil {
 		_ = pw.Close()
-		close(lines)
-		done <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Err: err}}
-		close(done)
-		return lines, done
+		close(linesCh)
+		doneCh <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Err: err}}
+		close(doneCh)
+		return cmdLine, linesCh, doneCh
 	}
 
 	waitErr := make(chan error, 1)
@@ -195,14 +211,14 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 			text := scanner.Text()
 			output.WriteString(text)
 			output.WriteByte('\n')
-			lines <- PlanLine{Text: text}
+			linesCh <- PlanLine{Text: text}
 		}
-		close(lines)
+		close(linesCh)
 
 		if err := <-waitErr; err != nil {
 			_ = os.Remove(planFile)
-			done <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Output: output.Bytes(), Err: err}}
-			close(done)
+			doneCh <- PlanStreamResult{Err: &PlanError{Cmd: opts.Cmd, Output: output.Bytes(), Err: err}}
+			close(doneCh)
 			return
 		}
 
@@ -217,8 +233,8 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				stderr = exitErr.Stderr
 			}
-			done <- PlanStreamResult{Err: &ShowError{Cmd: opts.Cmd, Stderr: stderr, Err: err}}
-			close(done)
+			doneCh <- PlanStreamResult{Err: &ShowError{Cmd: opts.Cmd, Stderr: stderr, Err: err}}
+			close(doneCh)
 			return
 		}
 
@@ -227,8 +243,8 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 			if !opts.KeepPlanFile {
 				_ = os.Remove(planFile)
 			}
-			done <- PlanStreamResult{Err: fmt.Errorf("decoding plan JSON: %w", err)}
-			close(done)
+			doneCh <- PlanStreamResult{Err: fmt.Errorf("decoding plan JSON: %w", err)}
+			close(doneCh)
 			return
 		}
 
@@ -237,11 +253,11 @@ func PlanStream(ctx context.Context, opts Options) (<-chan PlanLine, <-chan Plan
 			_ = os.Remove(planFile)
 			result.PlanFile = ""
 		}
-		done <- PlanStreamResult{Result: result}
-		close(done)
+		doneCh <- PlanStreamResult{Result: result}
+		close(doneCh)
 	}()
 
-	return lines, done
+	return cmdLine, linesCh, doneCh
 }
 
 // ApplyLine is one line of streamed `apply` output.
@@ -298,21 +314,28 @@ type ApplyStreamResult struct {
 //
 // internal/runner takes no UI-framework dependency: pumping lines/done
 // into an event loop (e.g. a Bubble Tea tea.Cmd) is the caller's job.
-func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan ApplyLine, <-chan ApplyStreamResult) {
-	lines := make(chan ApplyLine, 64)
-	done := make(chan ApplyStreamResult, 1)
+//
+// The returned cmdLine is the exact command invoked, for a caller that
+// wants to show the user what's actually running; it's always
+// non-empty since, unlike PlanStream, there's no earlier step (like
+// reserving a temp file) that could fail before the command itself is
+// constructed.
+func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (cmdLine string, lines <-chan ApplyLine, done <-chan ApplyStreamResult) {
+	linesCh := make(chan ApplyLine, 64)
+	doneCh := make(chan ApplyStreamResult, 1)
 
 	applyCmd := exec.CommandContext(ctx, string(cmd), "apply", "-auto-approve", planFile)
+	cmdLine = strings.Join(applyCmd.Args, " ")
 	pr, pw := io.Pipe()
 	applyCmd.Stdout = pw
 	applyCmd.Stderr = pw
 
 	if err := applyCmd.Start(); err != nil {
 		_ = pw.Close()
-		close(lines)
-		done <- ApplyStreamResult{Err: &ApplyError{Cmd: cmd, Err: err}}
-		close(done)
-		return lines, done
+		close(linesCh)
+		doneCh <- ApplyStreamResult{Err: &ApplyError{Cmd: cmd, Err: err}}
+		close(doneCh)
+		return cmdLine, linesCh, doneCh
 	}
 
 	waitErr := make(chan error, 1)
@@ -328,20 +351,20 @@ func ApplyStream(ctx context.Context, cmd TFCommand, planFile string) (<-chan Ap
 			text := scanner.Text()
 			output.WriteString(text)
 			output.WriteByte('\n')
-			lines <- ApplyLine{Text: text}
+			linesCh <- ApplyLine{Text: text}
 		}
-		close(lines)
+		close(linesCh)
 
 		if err := <-waitErr; err != nil {
-			done <- ApplyStreamResult{Err: &ApplyError{Cmd: cmd, Output: output.Bytes(), Err: err}}
-			close(done)
+			doneCh <- ApplyStreamResult{Err: &ApplyError{Cmd: cmd, Output: output.Bytes(), Err: err}}
+			close(doneCh)
 			return
 		}
-		done <- ApplyStreamResult{Result: &ApplyResult{Output: output.Bytes()}}
-		close(done)
+		doneCh <- ApplyStreamResult{Result: &ApplyResult{Output: output.Bytes()}}
+		close(doneCh)
 	}()
 
-	return lines, done
+	return cmdLine, linesCh, doneCh
 }
 
 // DetectCommand returns "terraform" or "tofu" based on forceTofu and
