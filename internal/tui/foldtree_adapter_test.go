@@ -365,6 +365,12 @@ func TestSensitiveAttrRevealedShowsRealValue(t *testing.T) {
 // must never reach it -- the Sensitive check has to run first, or a
 // multi-line secret would get diffed line-by-line and displayed in full
 // even though revealSensitive is off.
+// A sensitive multi-line value (e.g. a private key or YAML/JSON secret
+// body) stays a flat, single-line "(sensitive value)" row while
+// redacted, matching every other sensitive attribute -- but once
+// revealed, it must go through the same foldable, per-line diff every
+// ordinary multi-line value gets, rather than flattening embedded
+// newlines into one unreadable %q-escaped line.
 func TestSensitiveMultilineValueStaysRedactedUntilRevealed(t *testing.T) {
 	oldKey := "-----BEGIN KEY-----\nold-line\n-----END KEY-----"
 	newKey := "-----BEGIN KEY-----\nnew-line\n-----END KEY-----"
@@ -382,7 +388,7 @@ func TestSensitiveMultilineValueStaysRedactedUntilRevealed(t *testing.T) {
 	}
 	info := payloadOf(t, node.Children[0])
 	if info.kind != rowSensitive {
-		t.Fatalf("kind = %v, want rowSensitive (must not be routed through the multiline-diff path)", info.kind)
+		t.Fatalf("kind = %v, want rowSensitive while redacted (must not be routed through the multiline-diff path)", info.kind)
 	}
 	text := stripRenderANSI(info.text)
 	if strings.Contains(text, "old-line") || strings.Contains(text, "new-line") {
@@ -392,12 +398,20 @@ func TestSensitiveMultilineValueStaysRedactedUntilRevealed(t *testing.T) {
 	m.revealSensitive = true
 	node = m.buildResourceNode(r)
 	info = payloadOf(t, node.Children[0])
-	if info.kind != rowSensitive {
-		t.Fatalf("kind = %v, want rowSensitive even when revealed", info.kind)
+	if info.kind != rowMultilineHeader {
+		t.Fatalf("kind = %v, want rowMultilineHeader once revealed", info.kind)
 	}
-	text = stripRenderANSI(info.text)
-	if !strings.Contains(text, "old-line") || !strings.Contains(text, "new-line") {
-		t.Fatalf("revealed text = %q, want it to contain the real multiline content", text)
+	if len(node.Children[0].Children) != 2 {
+		t.Fatalf("got %d multiline children, want 2 (body + EOT)", len(node.Children[0].Children))
+	}
+	body := stripRenderANSI(payloadOf(t, node.Children[0].Children[0]).text)
+	if !strings.Contains(body, "old-line") || !strings.Contains(body, "new-line") {
+		t.Fatalf("revealed body = %q, want it to contain the real multiline content, diffed line by line", body)
+	}
+
+	header := stripRenderANSI(m.renderFoldHeader("", info.attr, info.keyed, false, false, 120, "<<EOT", multilineFoldSummary(info.attr)))
+	if !strings.Contains(header, "(revealed)") {
+		t.Fatalf("revealed header = %q, want a \"(revealed)\" marker distinguishing it from an ordinary multi-line attribute", header)
 	}
 }
 

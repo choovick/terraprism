@@ -101,7 +101,17 @@ func (m *Model) buildAttributeNodes(address string, attrs []tfplan.Attribute, de
 		// relying on isContainerAttr's own "!a.Sensitive" guard and the
 		// others incidentally failing on a redacted nil value, keeps
 		// redaction unconditional regardless of what those checks do.
-		if attr.Sensitive {
+		//
+		// The one deliberate exception: a revealed multi-line sensitive
+		// value (e.g. a YAML/JSON secret body) falls through to the
+		// isMultilineStringAttr block below instead of this flat row, so
+		// it gets the same foldable, per-line diff every other multi-line
+		// value gets -- flattening it into one %q-escaped line here would
+		// turn embedded newlines into literal "\n" text and make it
+		// unreadable. renderMultilineStringBody still redacts it itself
+		// whenever revealSensitive is off, so this is never reachable
+		// while the value is still hidden.
+		if attr.Sensitive && (!m.revealSensitive || !isMultilineStringAttr(attr)) {
 			id := foldKey(address, attr.Path)
 			var text string
 			if m.revealSensitive {

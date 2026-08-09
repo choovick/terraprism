@@ -1040,11 +1040,21 @@ func (m Model) renderFoldHeader(indent string, attr tfplan.Attribute, keyed, col
 		indicator = collapsedIndicator
 	}
 
+	// attr.Sensitive is only ever true here for a revealed multi-line
+	// sensitive value (see buildAttributeNodes) -- an ordinary container
+	// header never has it set, since isContainerAttr excludes sensitive
+	// attributes. The marker mirrors renderRevealedSensitiveValue's flat
+	// case, so a revealed secret reads the same way everywhere.
+	marker := ""
+	if attr.Sensitive {
+		marker = fastSensitive.Render("(revealed) ")
+	}
+
 	var content string
 	if keyed {
-		content = fastAttrName.Render(attr.Name) + " = " + fastMuted.Render(opener)
+		content = marker + fastAttrName.Render(attr.Name) + " = " + fastMuted.Render(opener)
 	} else {
-		content = fastMuted.Render(opener)
+		content = marker + fastMuted.Render(opener)
 	}
 
 	result := indent + indicator + " " + actionPrefixSymbol(attr.Action) + " " + content
@@ -1182,7 +1192,11 @@ func (m Model) renderMultilineStringBody(attr tfplan.Attribute, indent string, m
 	var b strings.Builder
 	contentIndent := indent + "  "
 
-	if attr.Sensitive {
+	// buildAttributeNodes only ever routes a sensitive attribute here once
+	// revealSensitive is on (see its comment), but this guard stays as a
+	// defensive fallback for any other caller -- e.g. a future one that
+	// builds a multiline row directly.
+	if attr.Sensitive && !m.revealSensitive {
 		b.WriteString(contentIndent)
 		b.WriteString(fastSensitive.Render("(sensitive value)"))
 		return b.String()
