@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wordwrap"
 	"github.com/muesli/reflow/wrap"
 )
@@ -39,11 +40,13 @@ const wrapMinWidth = 10
 // mirroring TreeView's own key vocabulary — bubbles/viewport's own
 // default keymap already covers j/k/u/d/pgup/pgdown and left/right.
 type LogPane struct {
-	viewport viewport.Model
-	lines    []string // original, unwrapped lines -- what search matches against
-	visible  bool
-	ready    bool
-	pendingG bool
+	viewport    viewport.Model
+	lines       []string // original, unwrapped lines -- what search matches against
+	visible     bool
+	ready       bool
+	pendingG    bool
+	title       string // "" hides the title bar entirely (the default)
+	totalHeight int    // height last passed to SetSize; viewport.Height is derived from this minus the title bar's own line, if any
 
 	// wrappedLineStarts[i] is the row index within the viewport's
 	// displayed content where original line i begins -- needed to scroll
@@ -79,8 +82,12 @@ func NewLogPane() *LogPane {
 	return p
 }
 
-// SetSize resizes the underlying viewport, preserving whether it was
-// pinned to the bottom. A width change re-wraps existing content.
+// SetSize resizes the pane, preserving whether it was pinned to the
+// bottom. A width change re-wraps existing content. height is the pane's
+// total on-screen height, including the title bar's own line when a
+// title is set (see SetTitle) -- the caller's height budget for this
+// pane never changes because of a title, only how much of it the
+// viewport itself gets.
 func (p *LogPane) SetSize(width, height int) {
 	if width < 0 {
 		width = 0
@@ -91,7 +98,8 @@ func (p *LogPane) SetSize(width, height int) {
 	wasAtBottom := !p.ready || p.viewport.AtBottom()
 	widthChanged := p.viewport.Width != width
 	p.viewport.Width = width
-	p.viewport.Height = height
+	p.totalHeight = height
+	p.viewport.Height = p.contentHeight()
 	p.ready = true
 	if widthChanged {
 		p.refreshContent()
@@ -99,6 +107,33 @@ func (p *LogPane) SetSize(width, height int) {
 	if wasAtBottom {
 		p.viewport.GotoBottom()
 	}
+}
+
+// SetTitle sets the text shown in the pane's title bar: a single
+// horizontal rule with the title embedded near its left edge, spanning
+// only the pane's top edge -- not a full box border -- so a host can
+// tell the pane apart from whatever's stacked above it without the
+// visual weight of a frame. "" (the default) hides the title bar
+// entirely and gives its line back to the viewport.
+func (p *LogPane) SetTitle(title string) {
+	if p.title == title {
+		return
+	}
+	p.title = title
+	p.viewport.Height = p.contentHeight()
+}
+
+// contentHeight returns how much of totalHeight the viewport itself
+// gets, reserving one line for the title bar when one is set.
+func (p LogPane) contentHeight() int {
+	h := p.totalHeight
+	if p.title != "" {
+		h--
+	}
+	if h < 0 {
+		h = 0
+	}
+	return h
 }
 
 // SetLines bulk-loads a completed document (e.g. `terraform plan`'s
@@ -383,5 +418,34 @@ func (p LogPane) View() string {
 	if !p.visible {
 		return ""
 	}
-	return p.viewport.View()
+	if p.title == "" {
+		return p.viewport.View()
+	}
+	return p.renderTitleBar() + "\n" + p.viewport.View()
+}
+
+// titleBarLeadWidth is how many rule characters lead the title bar
+// before the title text itself, e.g. "── Output ────...".
+const titleBarLeadWidth = 2
+
+// renderTitleBar renders the title bar's single line: a horizontal rule
+// the full width of the pane, with the title embedded near the left
+// edge. Falls back to a plain, title-less rule if the pane is too
+// narrow to fit the title at all, rather than overflowing the pane's
+// width.
+func (p LogPane) renderTitleBar() string {
+	width := p.viewport.Width
+	if width <= 0 {
+		return mutedTextStyle.Render(" " + p.title + " ")
+	}
+
+	label := " " + p.title + " "
+	labelWidth := lipgloss.Width(label)
+	trailWidth := width - titleBarLeadWidth - labelWidth
+	if trailWidth < 0 {
+		return mutedTextStyle.Render(strings.Repeat("─", width))
+	}
+	lead := strings.Repeat("─", titleBarLeadWidth)
+	trail := strings.Repeat("─", trailWidth)
+	return mutedTextStyle.Render(lead + label + trail)
 }

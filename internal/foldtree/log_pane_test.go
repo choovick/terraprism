@@ -112,6 +112,84 @@ func TestLogPaneResizePreservesFollowState(t *testing.T) {
 	}
 }
 
+func TestLogPaneNoTitleHasNoTitleBar(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(40, 5)
+	p.SetLines([]string{"a", "b"})
+	p.SetVisible(true)
+	if strings.Contains(p.View(), "─") {
+		t.Fatalf("no title set: View() should have no rule line, got %q", p.View())
+	}
+	if p.Height() != 5 {
+		t.Fatalf("no title set: Height() = %d, want the full 5 requested via SetSize", p.Height())
+	}
+}
+
+func TestLogPaneTitleBarRendersAboveContentAndReservesOneLine(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(40, 5)
+	p.SetTitle("Plan Output")
+	p.SetLines([]string{"first line"})
+	p.SetVisible(true)
+
+	if p.Height() != 4 {
+		t.Fatalf("Height() = %d, want 4 (5 requested minus the title bar's own line)", p.Height())
+	}
+
+	lines := strings.Split(p.View(), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected at least a title line followed by content, got %d line(s): %q", len(lines), p.View())
+	}
+	if !strings.Contains(lines[0], "Plan Output") {
+		t.Fatalf("first line = %q, want it to contain the title", lines[0])
+	}
+	if !strings.Contains(lines[0], "─") {
+		t.Fatalf("first line = %q, want it to contain the rule character", lines[0])
+	}
+	if !strings.Contains(lines[1], "first line") {
+		t.Fatalf("second line = %q, want the pane's actual content", lines[1])
+	}
+}
+
+// SetTitle("") must give the reserved line back to the viewport, and a
+// hidden pane must still render nothing regardless of title.
+func TestLogPaneClearingTitleRestoresFullHeight(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(40, 5)
+	p.SetTitle("Apply Output")
+	if p.Height() != 4 {
+		t.Fatalf("Height() with title = %d, want 4", p.Height())
+	}
+
+	p.SetTitle("")
+	if p.Height() != 5 {
+		t.Fatalf("Height() after clearing title = %d, want the full 5 back", p.Height())
+	}
+
+	p.SetLines([]string{"content"})
+	if p.View() != "" {
+		t.Fatalf("pane is still hidden; View() should be empty regardless of title, got %q", p.View())
+	}
+}
+
+// A pane too narrow to fit the title text at all must fall back to a
+// plain, title-less rule rather than overflowing its own width.
+func TestLogPaneTitleBarFallsBackWhenTooNarrow(t *testing.T) {
+	p := NewLogPane()
+	p.SetSize(5, 3)
+	p.SetTitle("A Much Longer Title Than Fits")
+	p.SetVisible(true)
+	p.SetLines([]string{"x"})
+
+	lines := strings.Split(p.View(), "\n")
+	if len(lines) < 1 {
+		t.Fatalf("expected at least the title bar line")
+	}
+	if strings.Contains(lines[0], "A Much Longer Title") {
+		t.Fatalf("title bar should have fallen back to a plain rule when too narrow, got %q", lines[0])
+	}
+}
+
 // Regression: LogPane.Update must handle tea.WindowSizeMsg itself by
 // resizing the viewport (bubbles/viewport.Update never resizes on its
 // own -- Width/Height are plain fields the host must set), the same way

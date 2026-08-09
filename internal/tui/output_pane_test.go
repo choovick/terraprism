@@ -69,9 +69,13 @@ func TestReflowGivesOutputPaneMostOfTheScreen(t *testing.T) {
 		t.Fatalf("expected treeView to shrink to the fixed context height (%d) once the pane is shown, got %d",
 			treeHeightWithOutputVisible, mm.treeView.Height())
 	}
-	if mm.treeView.Height()+mm.outputPane.Height() != fullTreeHeight {
-		t.Fatalf("expected treeView height + outputPane height to equal the pre-toggle full height (%d), got %d+%d",
-			fullTreeHeight, mm.treeView.Height(), mm.outputPane.Height())
+	// outputPane.Height() reports only the viewport's own content rows --
+	// its 1-line title bar (always set here, since planOutput != "") comes
+	// out of the same height budget reflow gave the pane, so it has to be
+	// added back in to recover the total.
+	if got, want := mm.treeView.Height()+mm.outputPane.Height()+1, fullTreeHeight; got != want {
+		t.Fatalf("expected treeView height + outputPane height + its title bar line to equal the pre-toggle full height (%d), got %d",
+			fullTreeHeight, got)
 	}
 	if mm.outputPane.Height() <= mm.treeView.Height() {
 		t.Fatalf("expected the output pane to take up most of the screen, got pane=%d tree=%d", mm.outputPane.Height(), mm.treeView.Height())

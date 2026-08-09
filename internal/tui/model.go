@@ -212,6 +212,7 @@ func newModel(plan *tfplan.Plan, version string, planOutput string) Model {
 	m.outputPane = *foldtree.NewLogPane()
 	if planOutput != "" {
 		m.outputPane.SetLines(strings.Split(planOutput, "\n"))
+		m.outputPane.SetTitle("Plan Output")
 	}
 	return m
 }
@@ -249,6 +250,7 @@ func NewModelPlanning(opts runner.Options, version string, applyMode bool) Model
 	m.tfCommand = string(opts.Cmd)
 	m.planOptions = opts
 	m.planning = true
+	m.outputPane.SetTitle("Plan Output")
 	m.outputPane.SetVisible(true)
 	return m
 }
@@ -446,6 +448,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyLines = msg.lines
 		m.applyDone = msg.done
 		m.outputPane.Reset()
+		m.outputPane.SetTitle("Apply Output")
 		m.outputPane.SetVisible(true)
 		m.reflow()
 		return m, waitForApplyEvent(msg.lines, msg.done)
