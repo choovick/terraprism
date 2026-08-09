@@ -10,6 +10,7 @@ package tfplan
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -116,8 +117,8 @@ func TestDecode(t *testing.T) {
 				if !name.Sensitive {
 					t.Errorf("tags.Name should be sensitive")
 				}
-				if name.Old != nil || name.New != nil {
-					t.Errorf("sensitive leaf should have redacted Old/New, got Old=%v New=%v", name.Old, name.New)
+				if name.Old != "old-secret-name" || name.New != "new-secret-name" {
+					t.Errorf("sensitive leaf should still carry its real Old/New (redaction is a display concern), got Old=%v New=%v", name.Old, name.New)
 				}
 				env := findAttr(t, tags.Children, "Environment")
 				if env.Sensitive {
@@ -309,6 +310,56 @@ func findAttr(t *testing.T, attrs []Attribute, name string) Attribute {
 	}
 	t.Fatalf("attribute %q not found among %d attributes", name, len(attrs))
 	return Attribute{}
+}
+
+// A whole-subtree-sensitive attribute (before_sensitive/after_sensitive
+// is the bare bool true at a container path, not a per-child map) still
+// carries its real value on Old/New -- just not recursed into Children
+// -- the same "redaction is a display concern, not a decode-time one"
+// contract as a sensitive leaf.
+func TestSensitiveWholeSubtreeCarriesRealValue(t *testing.T) {
+	raw := []byte(`{
+		"format_version": "1.2",
+		"resource_changes": [{
+			"address": "aws_db_instance.main",
+			"mode": "managed",
+			"type": "aws_db_instance",
+			"name": "main",
+			"change": {
+				"actions": ["update"],
+				"before": {"credentials": {"user": "old-user", "pass": "old-pass"}},
+				"after": {"credentials": {"user": "new-user", "pass": "new-pass"}},
+				"after_unknown": {},
+				"before_sensitive": {"credentials": true},
+				"after_sensitive": {"credentials": true}
+			}
+		}],
+		"output_changes": {}
+	}`)
+
+	p, err := DecodeBytes(raw)
+	if err != nil {
+		t.Fatalf("DecodeBytes: %v", err)
+	}
+	if len(p.Resources) != 1 {
+		t.Fatalf("got %d resources, want 1", len(p.Resources))
+	}
+
+	creds := findAttr(t, p.Resources[0].Attributes, "credentials")
+	if !creds.Sensitive {
+		t.Errorf("credentials should be marked sensitive")
+	}
+	if len(creds.Children) != 0 {
+		t.Errorf("sensitive container should not recurse into Children, got %+v", creds.Children)
+	}
+	wantOld := map[string]interface{}{"user": "old-user", "pass": "old-pass"}
+	wantNew := map[string]interface{}{"user": "new-user", "pass": "new-pass"}
+	if !reflect.DeepEqual(creds.Old, wantOld) {
+		t.Errorf("credentials.Old = %#v, want %#v", creds.Old, wantOld)
+	}
+	if !reflect.DeepEqual(creds.New, wantNew) {
+		t.Errorf("credentials.New = %#v, want %#v", creds.New, wantNew)
+	}
 }
 
 func TestFormatVersionCompatibility(t *testing.T) {

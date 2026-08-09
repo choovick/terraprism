@@ -29,13 +29,20 @@ func buildAttribute(name, path string, before, after any, beforeExists, afterExi
 	kind := pickKind(before, after)
 
 	if sensitiveHere {
-		// Whole subtree redacted: don't expose values or recurse into
-		// children, matching Terraform CLI's "(sensitive value)" display.
+		// Whole subtree: don't recurse into children, matching Terraform
+		// CLI's "(sensitive value)" display -- but the real Old/New value
+		// is still carried (Terraform's own JSON output doesn't redact it
+		// either; before_sensitive/after_sensitive is a side-channel the
+		// CLI's human-readable renderer uses to decide what to mask).
+		// Redacting on-screen by default is internal/tui's job, driven by
+		// this Sensitive flag.
 		return Attribute{
 			Name:      name,
 			Path:      path,
 			Kind:      kind,
 			Action:    diffAction(before, after, beforeExists, afterExists, unknownHere),
+			Old:       before,
+			New:       after,
 			Computed:  unknownHere,
 			Sensitive: true,
 		}

@@ -94,6 +94,26 @@ func (m *Model) buildAttributeNodes(address string, attrs []tfplan.Attribute, de
 			continue
 		}
 
+		// Checked before tryRenderUserdataAttr/isContainerAttr/
+		// isMultilineStringAttr: those all inspect attr.Old/New, which
+		// now carry the real value for a sensitive attribute too (see
+		// tfplan.buildAttribute). Gating on Sensitive first, rather than
+		// relying on isContainerAttr's own "!a.Sensitive" guard and the
+		// others incidentally failing on a redacted nil value, keeps
+		// redaction unconditional regardless of what those checks do.
+		if attr.Sensitive {
+			id := foldKey(address, attr.Path)
+			var text string
+			if m.revealSensitive {
+				text = indent + actionPrefixSymbol(attr.Action) + " " + renderRevealedSensitiveValue(attr, keyed)
+			} else {
+				text = indent + actionPrefixSymbol(attr.Action) + " " + renderKeyValue(attr, keyed)
+			}
+			info := rowInfo{kind: rowSensitive, attr: attr, text: text}
+			nodes = append(nodes, foldtree.Node{ID: id, Height: 1, Payload: info})
+			continue
+		}
+
 		if keyed {
 			if decoded, ok := m.tryRenderUserdataAttr(attr, indent, maxWidth); ok {
 				id := foldKey(address, attr.Path)
@@ -115,14 +135,6 @@ func (m *Model) buildAttributeNodes(address string, attrs []tfplan.Attribute, de
 
 			info := rowInfo{kind: rowContainerHeader, attr: attr, keyed: keyed}
 			nodes = append(nodes, foldtree.Node{ID: id, Height: 1, Collapsible: true, Payload: info, Children: children})
-			continue
-		}
-
-		if attr.Sensitive {
-			id := foldKey(address, attr.Path)
-			text := indent + actionPrefixSymbol(attr.Action) + " " + renderKeyValue(attr, keyed)
-			info := rowInfo{kind: rowSensitive, attr: attr, text: text}
-			nodes = append(nodes, foldtree.Node{ID: id, Height: 1, Payload: info})
 			continue
 		}
 

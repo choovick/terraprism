@@ -163,6 +163,13 @@ Large maps and lists inside expanded resources become foldable sub-blocks. Large
 
 Multi-line string values (Helm chart values, cloud-init scripts, JSON policy documents) are shown as a focused line-by-line diff rather than one opaque blob. Use `+`/`=` and `-` to increase or decrease the unchanged context shown around each diff hunk.
 
+### Sensitive Values
+| Key | Action |
+|-----|--------|
+| `x` | Reveal/hide the real value of sensitive attributes |
+
+Sensitive attributes are redacted as `(sensitive value)` by default, matching Terraform CLI. Press `x` to reveal the real diff for the rest of the session (off again next time you run `terraprism`); press it again to re-redact.
+
 ### Search
 | Key | Action |
 |-----|--------|

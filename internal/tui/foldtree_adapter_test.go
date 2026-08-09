@@ -321,6 +321,86 @@ func TestSensitiveAttrIsOwnNode(t *testing.T) {
 	}
 }
 
+// The 'x' hotkey (m.revealSensitive) swaps a sensitive attribute's row
+// text between the redacted placeholder and its real diff -- toggling
+// the flag directly here (rather than driving it through a key press)
+// isolates the rendering behavior from the key-handling wiring, which
+// TestOutputTogglePreAndPostApply-style tests already cover for other
+// toggles.
+func TestSensitiveAttrRevealedShowsRealValue(t *testing.T) {
+	r := tfplan.Resource{
+		Address: "aws_db_instance.main",
+		Attributes: withPaths([]tfplan.Attribute{
+			{Name: "password", Kind: tfplan.KindString, Action: tfplan.ActionUpdate, Sensitive: true, Old: "old-secret", New: "new-secret"},
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+
+	node := m.buildResourceNode(r)
+	text := stripRenderANSI(payloadOf(t, node.Children[0]).text)
+	if strings.Contains(text, "old-secret") || strings.Contains(text, "new-secret") {
+		t.Fatalf("redacted (default) text leaked the real value: %q", text)
+	}
+	if !strings.Contains(text, "(sensitive value)") {
+		t.Fatalf("redacted text = %q, want it to contain \"(sensitive value)\"", text)
+	}
+
+	m.revealSensitive = true
+	node = m.buildResourceNode(r)
+	text = stripRenderANSI(payloadOf(t, node.Children[0]).text)
+	if strings.Contains(text, "(sensitive value)") {
+		t.Fatalf("revealed text still redacted: %q", text)
+	}
+	if !strings.Contains(text, "old-secret") || !strings.Contains(text, "new-secret") {
+		t.Fatalf("revealed text = %q, want it to contain both old-secret and new-secret", text)
+	}
+	if !strings.Contains(text, "(revealed)") {
+		t.Fatalf("revealed text = %q, want a \"(revealed)\" marker distinguishing it from an ordinary attribute", text)
+	}
+}
+
+// Regression guard for the buildAttributeNodes reordering: isMultilineStringAttr
+// (unlike isContainerAttr and tryRenderUserdataAttr) has no Sensitive
+// guard of its own, so a sensitive multi-line value (e.g. a private key)
+// must never reach it -- the Sensitive check has to run first, or a
+// multi-line secret would get diffed line-by-line and displayed in full
+// even though revealSensitive is off.
+func TestSensitiveMultilineValueStaysRedactedUntilRevealed(t *testing.T) {
+	oldKey := "-----BEGIN KEY-----\nold-line\n-----END KEY-----"
+	newKey := "-----BEGIN KEY-----\nnew-line\n-----END KEY-----"
+	r := tfplan.Resource{
+		Address: "tls_private_key.main",
+		Attributes: withPaths([]tfplan.Attribute{
+			{Name: "private_key_pem", Kind: tfplan.KindString, Action: tfplan.ActionUpdate, Sensitive: true, Old: oldKey, New: newKey},
+		}, ""),
+	}
+	m := testModelForAdapter(120, 40, defaultDiffContext)
+
+	node := m.buildResourceNode(r)
+	if len(node.Children) != 1 {
+		t.Fatalf("got %d children, want 1 (multiline diffing would add EOT/body children)", len(node.Children))
+	}
+	info := payloadOf(t, node.Children[0])
+	if info.kind != rowSensitive {
+		t.Fatalf("kind = %v, want rowSensitive (must not be routed through the multiline-diff path)", info.kind)
+	}
+	text := stripRenderANSI(info.text)
+	if strings.Contains(text, "old-line") || strings.Contains(text, "new-line") {
+		t.Fatalf("redacted text leaked multiline secret content: %q", text)
+	}
+
+	m.revealSensitive = true
+	node = m.buildResourceNode(r)
+	info = payloadOf(t, node.Children[0])
+	if info.kind != rowSensitive {
+		t.Fatalf("kind = %v, want rowSensitive even when revealed", info.kind)
+	}
+	text = stripRenderANSI(info.text)
+	if !strings.Contains(text, "old-line") || !strings.Contains(text, "new-line") {
+		t.Fatalf("revealed text = %q, want it to contain the real multiline content", text)
+	}
+}
+
 // Synthetic IDs must be deterministic across rebuilds of the identical
 // data, since foldtree's cursor-preservation-by-ID depends on it -- if
 // the cursor happens to sit on a closing bracket / EOT / noop-note row

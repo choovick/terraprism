@@ -37,6 +37,16 @@ func renderScalarText(v any) string {
 		return t.String()
 	case string:
 		return fmt.Sprintf("%q", t)
+	case []interface{}, map[string]interface{}:
+		// Only reachable for a whole-subtree-sensitive attribute revealed
+		// via renderRevealedSensitiveValue -- an ordinary container is
+		// always walked into Children and never reaches this function
+		// with a raw map/list value.
+		b, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Sprintf("%v", t)
+		}
+		return string(b)
 	default:
 		return fmt.Sprintf("%v", t)
 	}
@@ -92,6 +102,19 @@ func renderKeyValue(attr tfplan.Attribute, keyed bool) string {
 		return renderLeafValue(attr)
 	}
 	return fastAttrName.Render(attr.Name) + " = " + renderLeafValue(attr)
+}
+
+// renderRevealedSensitiveValue renders a sensitive attribute's real
+// value once the user has opted in via the 'x' hotkey, using the same
+// create/delete/update diff coloring as an ordinary attribute so the
+// actual change is visible. Prefixed with a plain-text marker (not an
+// emoji) so it stays visually distinguishable from a non-sensitive
+// attribute at a glance, without risking lipgloss's Width() miscounting
+// a double-width glyph the way an emoji marker could.
+func renderRevealedSensitiveValue(attr tfplan.Attribute, keyed bool) string {
+	revealed := attr
+	revealed.Sensitive = false
+	return fastSensitive.Render("(revealed) ") + renderKeyValue(revealed, keyed)
 }
 
 // containerBrackets returns the open/close delimiters for a container

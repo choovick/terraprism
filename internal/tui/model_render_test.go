@@ -324,6 +324,58 @@ func TestDiffContextHotkeysClampContext(t *testing.T) {
 	}
 }
 
+// End-to-end 'x' hotkey test through the real Update() pipeline (as
+// opposed to TestSensitiveAttrRevealedShowsRealValue, which calls
+// buildResourceNode directly) -- mirrors TestOutputTogglePreAndPostApply's
+// style for the analogous 'o' toggle.
+func TestToggleSensitiveHotkeyRevealsRealValues(t *testing.T) {
+	plan := &tfplan.Plan{Resources: []tfplan.Resource{
+		{
+			Address: "aws_db_instance.main",
+			Action:  tfplan.ActionUpdate,
+			Attributes: withPaths([]tfplan.Attribute{
+				leafSensitive("password", tfplan.ActionUpdate, "old-secret", "new-secret"),
+			}, ""),
+		},
+	}}
+	m := NewModel(plan, "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	mm := model.(Model)
+	mm.treeView.State().ExpandAll() // resources start collapsed by default; the sensitive row must be visible
+
+	view := stripRenderANSI(mm.View())
+	if !strings.Contains(view, "(sensitive value)") {
+		t.Fatalf("expected redacted value by default, got:\n%s", view)
+	}
+	if strings.Contains(view, "old-secret") || strings.Contains(view, "new-secret") {
+		t.Fatalf("real value leaked before revealing:\n%s", view)
+	}
+
+	model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	mm = model.(Model)
+	view = stripRenderANSI(mm.View())
+	if !strings.Contains(view, "old-secret") || !strings.Contains(view, "new-secret") {
+		t.Fatalf("expected 'x' to reveal the real value, got:\n%s", view)
+	}
+
+	model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	mm = model.(Model)
+	view = stripRenderANSI(mm.View())
+	if !strings.Contains(view, "(sensitive value)") {
+		t.Fatalf("expected a second 'x' to re-redact, got:\n%s", view)
+	}
+	if strings.Contains(view, "old-secret") || strings.Contains(view, "new-secret") {
+		t.Fatalf("real value leaked after re-redacting:\n%s", view)
+	}
+}
+
+// leafSensitive builds a sensitive scalar attribute for tests, carrying
+// its real Old/New (matching tfplan.buildAttribute's actual behavior)
+// rather than the redacted nil a naive test fixture might assume.
+func leafSensitive(name string, action tfplan.Action, old, new any) tfplan.Attribute {
+	return tfplan.Attribute{Name: name, Kind: tfplan.KindString, Action: action, Sensitive: true, Old: old, New: new}
+}
+
 // nestedMetadataResource builds a resource with a two-level-deep fold
 // tree: metadata { values { nested = true } }.
 func nestedMetadataResource() tfplan.Resource {

@@ -26,6 +26,7 @@ type Model struct {
 	planOutput      string            // captured `plan` output, shown in the output pane via 'o'
 	defaultsApplied map[string]bool   // node IDs that have already had a default collapse state applied
 	diffContext     int
+	revealSensitive bool // 'x' toggle: show real values for sensitive attributes instead of "(sensitive value)"
 	ready           bool
 	width           int
 	height          int
@@ -552,6 +553,7 @@ var tuiKeyHandlers = map[string]normalKeyHandler{
 	"+":      handleKeyIncreaseDiffContext,
 	"=":      handleKeyIncreaseDiffContext,
 	"-":      handleKeyDecreaseDiffContext,
+	"x":      handleKeyToggleSensitive,
 	"a":      handleKeyApply,
 	"y":      handleKeyConfirmApply,
 }
@@ -624,6 +626,15 @@ func handleKeyIncreaseDiffContext(m Model) (Model, tea.Cmd, bool) {
 func handleKeyDecreaseDiffContext(m Model) (Model, tea.Cmd, bool) {
 	m.diffContext = clampDiffContext(m.diffContextSize() - diffContextStep)
 	m.rebuildTree()
+	return m, nil, true
+}
+
+// handleKeyToggleSensitive shows/hides the real value of sensitive
+// attributes (redacted as "(sensitive value)" by default, matching
+// Terraform CLI). Off by default every time the TUI starts.
+func handleKeyToggleSensitive(m Model) (Model, tea.Cmd, bool) {
+	m.revealSensitive = !m.revealSensitive
+	m.rebuildTree() // reveal state changes rendered row text
 	return m, nil, true
 }
 
@@ -1693,6 +1704,11 @@ func (m Model) viewHelpFooter() string {
 		}
 	}
 
+	sensitiveHint := "x: reveal secrets"
+	if m.revealSensitive {
+		sensitiveHint = "x: hide secrets"
+	}
+
 	if m.applyMode {
 		if m.confirmApply {
 			return "y: confirm apply • any key: cancel"
@@ -1705,7 +1721,7 @@ func (m Model) viewHelpFooter() string {
 		// covers that state instead) or if the plan has nothing to apply --
 		// in either case there's nothing this key would do.
 		if m.applyAttempted || !m.hasApplicableChanges() {
-			full := fmt.Sprintf("j/k/↑↓: navigate • e/c: scope • E/C: all • /: search • f: filter • s: sort%s • q: quit", outputHint)
+			full := fmt.Sprintf("j/k/↑↓: navigate • e/c: scope • E/C: all • /: search • f: filter • s: sort • %s%s • q: quit", sensitiveHint, outputHint)
 			if lipgloss.Width(full) <= maxWidth {
 				return full
 			}
@@ -1716,7 +1732,7 @@ func (m Model) viewHelpFooter() string {
 			return "j/k nav • e/c • / search • q"
 		}
 		applyHint := lipgloss.NewStyle().Foreground(createColor).Bold(true).Render("a: APPLY")
-		full := fmt.Sprintf("%s • j/k/↑↓: navigate • e/c: scope • E/C: all • /: search • f: filter • s: sort%s • q: quit", applyHint, outputHint)
+		full := fmt.Sprintf("%s • j/k/↑↓: navigate • e/c: scope • E/C: all • /: search • f: filter • s: sort • %s%s • q: quit", applyHint, sensitiveHint, outputHint)
 		if lipgloss.Width(full) <= maxWidth {
 			return full
 		}
@@ -1728,7 +1744,7 @@ func (m Model) viewHelpFooter() string {
 	}
 
 	helpOptions := []string{
-		"j/k/↑↓: navigate • l/→: expand • h/←/⌫: collapse • e/c: scope • E/C: all • +/-: diff context • Ctrl+E/Y: line scroll • d/u: page scroll • gg/G: top/bottom • /: search • f: filter • s: sort • q: quit",
+		"j/k/↑↓: navigate • l/→: expand • h/←/⌫: collapse • e/c: scope • E/C: all • +/-: diff context • Ctrl+E/Y: line scroll • d/u: page scroll • gg/G: top/bottom • /: search • f: filter • s: sort • " + sensitiveHint + " • q: quit",
 		"j/k: nav • l/h: fold • e/c: scope • E/C: all • +/-: diff ctx • Ctrl+E/Y: line • d/u: page • /: search • f/s • q",
 		"j/k nav • l/h fold • e/c scope • E/C all • +/- diff • Ctrl+E/Y scroll • / search • q",
 		"j/k nav • l/h fold • e/c • q",

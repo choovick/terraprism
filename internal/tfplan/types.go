@@ -52,14 +52,17 @@ type Attribute struct {
 	Action Action
 
 	// Old and New are decoded JSON scalars (string, json.Number, bool, or
-	// nil for absent/null). Both are nil for container nodes and for
-	// sensitive nodes, whose values are redacted.
+	// nil for absent/null) for an ordinary leaf, or the full decoded
+	// container value (map[string]interface{}/[]interface{}) for a
+	// whole-subtree-sensitive node -- see Sensitive below. Both are nil
+	// for an ordinary (non-sensitive) container node, which carries its
+	// values via Children instead.
 	Old any
 	New any
 
-	// Children is non-nil only for container nodes (Kind == KindList or
-	// KindMap), and empty for sensitive containers (redacted, not
-	// recursed into).
+	// Children is non-nil only for a non-sensitive container node (Kind
+	// == KindList or KindMap), and empty for a sensitive container (not
+	// recursed into; its value is carried on Old/New as a whole instead).
 	Children []Attribute
 
 	Computed  bool // from after_unknown at this exact path
