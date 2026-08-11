@@ -8,6 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wordwrap"
@@ -30,6 +31,12 @@ type Model struct {
 	ready           bool
 	width           int
 	height          int
+
+	// spinner animates the "Running <cmd>..." banner while planning or
+	// applying; ticking is only kept alive while one of those is true
+	// (see the spinner.TickMsg case in Update) so it doesn't run forever
+	// in the background once nothing is left running.
+	spinner spinner.Model
 
 	// Plan-streaming fields: when planning is true, the model starts with
 	// an empty plan and Init() kicks off runner.PlanStream itself,
@@ -207,6 +214,7 @@ func newModel(plan *tfplan.Plan, version string, planOutput string) Model {
 		sortPicker:      newSortPicker(),
 		currentVersion:  version,
 		planOutput:      planOutput,
+		spinner:         spinner.New(spinner.WithSpinner(spinner.Dot)),
 	}
 	m.treeView = *foldtree.NewTreeView(m)
 	m.outputPane = *foldtree.NewLogPane()
@@ -332,7 +340,7 @@ func (m Model) Init() tea.Cmd {
 		cmds = append(cmds, checkUpdateCmd(m.currentVersion))
 	}
 	if m.planning {
-		cmds = append(cmds, m.startPlanCmd())
+		cmds = append(cmds, m.startPlanCmd(), m.spinner.Tick)
 	}
 	return tea.Batch(cmds...)
 }
@@ -401,6 +409,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateAvailable = msg.Version
 		m.reflow()
 		return m, nil
+
+	case spinner.TickMsg:
+		// Only keep the loop alive while there's actually something to
+		// animate for -- otherwise this would tick forever in the
+		// background for the rest of the session once planning/applying
+		// finished.
+		if !m.planning && !m.applying {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -704,7 +724,10 @@ func (m Model) applyCommandLine() string {
 func (m Model) startApply() (Model, tea.Cmd, bool) {
 	m.confirmApply = false
 	m.applying = true
-	return m, m.startApplyCmd(), true
+	// Planning's own spinner ticking (if any) already stopped once it
+	// finished, so this has to restart the loop rather than assume it's
+	// still running.
+	return m, tea.Batch(m.startApplyCmd(), m.spinner.Tick), true
 }
 
 // applyStreamStartedMsg carries the channels ApplyStream returns, once
@@ -1635,7 +1658,7 @@ func (m Model) viewConfirmationPrompt() string {
 			Bold(true).
 			Padding(0, 2).
 			Width(m.bannerWidth())
-		return "\n" + style.Render(fmt.Sprintf("⏳ Running %s (quit disabled until it finishes)", m.planCommandLine())) + "\n\n"
+		return "\n" + style.Render(fmt.Sprintf("%sRunning %s (quit disabled until it finishes)", m.spinner.View(), m.planCommandLine())) + "\n\n"
 	}
 	if m.planErr != nil {
 		style := lipgloss.NewStyle().
@@ -1653,7 +1676,7 @@ func (m Model) viewConfirmationPrompt() string {
 			Bold(true).
 			Padding(0, 2).
 			Width(m.bannerWidth())
-		return "\n" + style.Render(fmt.Sprintf("⏳ Running %s (quit disabled until it finishes)", m.applyCommandLine())) + "\n\n"
+		return "\n" + style.Render(fmt.Sprintf("%sRunning %s (quit disabled until it finishes)", m.spinner.View(), m.applyCommandLine())) + "\n\n"
 	}
 	if m.applyAttempted {
 		return m.viewApplyCompletionBanner()

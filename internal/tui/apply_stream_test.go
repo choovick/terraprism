@@ -33,6 +33,43 @@ func writeFakeApplyScript(t *testing.T) string {
 	return path
 }
 
+// stepCmd runs cmd and dispatches every message it produces through
+// m.Update, transparently unpacking a tea.BatchMsg (a []tea.Cmd) into its
+// constituent messages first -- real tea.Program does this unpacking
+// itself before a Model ever sees the individual messages, so a Model's
+// own Update is never expected to handle tea.BatchMsg directly. This
+// hand-driven test harness has to replicate that one step since more
+// than one independent tea.Cmd can now be in flight at once (e.g. the
+// spinner's own ticking alongside plan/apply progress), which is exactly
+// when tea.Batch stops collapsing to a single plain command. Returns the
+// updated model, the next cmd to drive (nil once everything in flight
+// produced no further cmd), and every message actually dispatched, so a
+// caller can check whether its target message type was among them.
+func stepCmd(m Model, cmd tea.Cmd) (Model, tea.Cmd, []tea.Msg) {
+	if cmd == nil {
+		return m, nil, nil
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		newModel, nextCmd := m.Update(msg)
+		return newModel.(Model), nextCmd, []tea.Msg{msg}
+	}
+
+	var msgs []tea.Msg
+	var nextCmds []tea.Cmd
+	for _, c := range batch {
+		var subMsgs []tea.Msg
+		var nextCmd tea.Cmd
+		m, nextCmd, subMsgs = stepCmd(m, c)
+		msgs = append(msgs, subMsgs...)
+		if nextCmd != nil {
+			nextCmds = append(nextCmds, nextCmd)
+		}
+	}
+	return m, tea.Batch(nextCmds...), msgs
+}
+
 // driveApplyToCompletion runs m's already-started apply stream to
 // completion by repeatedly invoking whatever tea.Cmd Update returns,
 // exactly as the real Bubble Tea runtime would, and returns the final
@@ -43,12 +80,12 @@ func driveApplyToCompletion(t *testing.T, m Model, cmd tea.Cmd) Model {
 		if cmd == nil {
 			t.Fatalf("expected a non-nil cmd while apply is still in flight")
 		}
-		msg := cmd()
-		var newModel tea.Model
-		newModel, cmd = m.Update(msg)
-		m = newModel.(Model)
-		if _, ok := msg.(applyDoneMsg); ok {
-			return m
+		var msgs []tea.Msg
+		m, cmd, msgs = stepCmd(m, cmd)
+		for _, msg := range msgs {
+			if _, ok := msg.(applyDoneMsg); ok {
+				return m
+			}
 		}
 	}
 	t.Fatalf("apply did not complete within 1000 messages")
@@ -195,6 +232,41 @@ func TestConfirmationBannerShowsLiteralCommandOnceStreamStarts(t *testing.T) {
 	mm.planCmdLine = "tofu plan -out=/tmp/terraprism-123.tfplan -no-color -target=aws_instance.foo"
 	if got := mm.viewConfirmationPrompt(); !strings.Contains(got, "Running "+mm.planCmdLine) {
 		t.Fatalf("expected plan banner to show the literal command, got:\n%s", got)
+	}
+}
+
+// The "Running <cmd>..." banner shows an animated spinner (one of
+// spinner.Dot's frames) instead of a static hourglass, and the spinner
+// keeps ticking only for as long as something is actually running --
+// once planning/applying finishes, a stray in-flight tick must be a
+// no-op rather than restarting the loop forever in the background.
+func TestSpinnerAnimatesWhileRunningAndStopsAfter(t *testing.T) {
+	m := NewModelWithApply(simplePlan(), "/dev/null", "terraform", "", "")
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	mm := model.(Model)
+
+	mm.applying = true
+	mm.applyCmdLine = "terraform apply -auto-approve /dev/null"
+	firstFrame := stripRenderANSI(mm.viewConfirmationPrompt())
+	if strings.Contains(firstFrame, "⏳") {
+		t.Fatalf("expected the static hourglass to be replaced by an animated spinner, got:\n%s", firstFrame)
+	}
+
+	updated, cmd := mm.Update(mm.spinner.Tick())
+	mm = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("expected the spinner to reschedule its own next tick while applying")
+	}
+	secondFrame := stripRenderANSI(mm.viewConfirmationPrompt())
+	if firstFrame == secondFrame {
+		t.Fatalf("expected the spinner frame to advance after a tick, got the same banner twice:\n%s", firstFrame)
+	}
+
+	mm.applying = false
+	updated, cmd = mm.Update(mm.spinner.Tick())
+	mm = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("expected a spinner tick to be a no-op once nothing is running, got a rescheduled cmd")
 	}
 }
 

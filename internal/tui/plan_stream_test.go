@@ -75,12 +75,12 @@ func driveToMsgType(t *testing.T, m Model, cmd tea.Cmd, want tea.Msg) Model {
 		if cmd == nil {
 			t.Fatalf("expected a non-nil cmd while planning is still in flight")
 		}
-		msg := cmd()
-		var newModel tea.Model
-		newModel, cmd = m.Update(msg)
-		m = newModel.(Model)
-		if wantType(msg) {
-			return m
+		var msgs []tea.Msg
+		m, cmd, msgs = stepCmd(m, cmd)
+		for _, msg := range msgs {
+			if wantType(msg) {
+				return m
+			}
 		}
 	}
 	t.Fatalf("planning did not complete within 1000 messages")
@@ -210,11 +210,15 @@ func TestNewModelPlanningAutoQuitsWhenPlanHasNoChanges(t *testing.T) {
 		if cmd == nil {
 			t.Fatalf("expected a non-nil cmd while planning is still in flight")
 		}
-		msg := cmd()
-		var newModel tea.Model
-		newModel, cmd = mm.Update(msg)
-		mm = newModel.(Model)
-		if _, ok := msg.(planDoneMsg); ok {
+		var msgs []tea.Msg
+		mm, cmd, msgs = stepCmd(mm, cmd)
+		var done bool
+		for _, msg := range msgs {
+			if _, ok := msg.(planDoneMsg); ok {
+				done = true
+			}
+		}
+		if done {
 			doneCmd = cmd
 			break
 		}
