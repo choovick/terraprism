@@ -196,11 +196,11 @@ func newSortPicker() foldtree.Picker[SortOrder] {
 	return *p
 }
 
-// treeHeightWithOutputVisible is how many lines the tree view keeps for
-// context when the output pane is open -- the pane itself takes the
-// rest of the content height, since it's usually the thing being
-// actively read (live plan/apply progress, or a captured log to search)
-// while it's open.
+// treeHeightWithOutputVisible is the most lines the tree view keeps for
+// context when the output pane is open -- a cap, not a fixed reservation
+// (see treeContentHeight): the pane itself takes the rest of the content
+// height, since it's usually the thing being actively read (live
+// plan/apply progress, or a captured log to search) while it's open.
 const treeHeightWithOutputVisible = 6
 
 // newModel builds the shared TreeView+LogPane plumbing for both NewModel
@@ -383,7 +383,7 @@ func (m *Model) reflow() {
 
 	treeHeight := contentHeight
 	if m.outputPane.Visible() {
-		treeHeight = treeHeightWithOutputVisible
+		treeHeight = m.treeContentHeight()
 	}
 	if treeHeight > contentHeight {
 		treeHeight = contentHeight
@@ -400,6 +400,29 @@ func (m *Model) reflow() {
 	m.treeView = newTV.(foldtree.TreeView)
 	newPane, _ := m.outputPane.Update(tea.WindowSizeMsg{Width: contentWidth, Height: auxHeight})
 	m.outputPane = newPane.(foldtree.LogPane)
+}
+
+// treeContentHeight returns how many lines the tree pane actually needs
+// to show its current content -- the empty-state message, or the sum of
+// each currently visible row's own height -- capped at
+// treeHeightWithOutputVisible so a large tree still leaves the output
+// pane most of the screen. Used instead of always reserving the full cap
+// so the output pane sits right below the tree/status area rather than
+// after a block of wasted blank space when there's little or nothing to
+// show above it, e.g. an empty tree while a plan is still streaming.
+func (m Model) treeContentHeight() int {
+	rows := m.treeView.State().Rows()
+	if len(rows) == 0 {
+		return 2 // the empty-state message plus its own trailing blank line
+	}
+	h := 0
+	for _, r := range rows {
+		h += r.Height
+	}
+	if h > treeHeightWithOutputVisible {
+		h = treeHeightWithOutputVisible
+	}
+	return h
 }
 
 // Update handles messages

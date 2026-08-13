@@ -65,9 +65,15 @@ func TestReflowGivesOutputPaneMostOfTheScreen(t *testing.T) {
 	model, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
 	mm = model.(Model)
 
-	if mm.treeView.Height() != treeHeightWithOutputVisible {
-		t.Fatalf("expected treeView to shrink to the fixed context height (%d) once the pane is shown, got %d",
-			treeHeightWithOutputVisible, mm.treeView.Height())
+	// simplePlan's single resource starts collapsed (the default), so the
+	// tree only actually needs 1 line -- reflow shrinks to that instead of
+	// always reserving the full treeHeightWithOutputVisible cap, so the
+	// output pane sits right below it rather than after a block of wasted
+	// blank space.
+	wantTreeHeight := 1
+	if mm.treeView.Height() != wantTreeHeight {
+		t.Fatalf("expected treeView to shrink to its actual content height (%d) once the pane is shown, got %d",
+			wantTreeHeight, mm.treeView.Height())
 	}
 	// outputPane.Height() reports only the viewport's own content rows --
 	// its 1-line title bar (always set here, since planOutput != "") comes

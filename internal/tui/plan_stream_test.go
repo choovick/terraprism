@@ -155,6 +155,29 @@ func TestNewModelPlanningStartsEmptyAndStreamsIntoOutputPane(t *testing.T) {
 	}
 }
 
+// While planning, the tree is empty (nothing to show but the "no
+// resources" message), and the output pane -- carrying the actually
+// useful live-streamed output -- must sit right below it, not after a
+// block of blank filler reserved for tree context that doesn't exist
+// yet. Regression for the tree pane always reserving a fixed height
+// regardless of how little content it actually had.
+func TestOutputPaneSitsCloseToStatusWhilePlanningWithEmptyTree(t *testing.T) {
+	m := NewModelPlanning(runner.Options{Cmd: runner.TFCommand("/bin/true")}, "", true)
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	mm := model.(Model)
+
+	if len(mm.treeView.State().Rows()) != 0 {
+		t.Fatalf("setup: expected an empty tree while planning")
+	}
+	if got, want := mm.treeView.Height(), 2; got != want {
+		t.Fatalf("expected the empty tree to shrink to its actual content height (%d) instead of reserving the full %d-line cap, got %d",
+			want, treeHeightWithOutputVisible, got)
+	}
+	if mm.outputPane.Height() <= treeHeightWithOutputVisible {
+		t.Fatalf("expected the reclaimed space to go to the output pane, got outputPane.Height()=%d", mm.outputPane.Height())
+	}
+}
+
 func TestNewModelPlanningFailureKeepsEmptyTreeAndAllowsQuit(t *testing.T) {
 	fake := writeFakePlanScript(t)
 	t.Setenv("FAKE_PLAN_LINES", "reading state...|Error: something went wrong")
