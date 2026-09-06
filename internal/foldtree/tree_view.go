@@ -162,6 +162,13 @@ func (t TreeView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.MouseButtonWheelDown:
 			t.nav.MoveMouse(mouseWheelDelta)
 			t.sync()
+		case tea.MouseButtonWheelLeft:
+			// A trackpad horizontal swipe or shift+wheel, reported as its
+			// own button rather than a modifier on WheelUp/Down -- same
+			// escape valve as the H/L keys, just via the mouse.
+			t.viewport.ScrollLeft(horizontalScrollStep)
+		case tea.MouseButtonWheelRight:
+			t.viewport.ScrollRight(horizontalScrollStep)
 		}
 		return t, nil
 

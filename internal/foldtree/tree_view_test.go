@@ -133,6 +133,35 @@ func TestTreeViewMouseWheelScrolls(t *testing.T) {
 	}
 }
 
+// The horizontal wheel (a trackpad swipe or shift+wheel) is reported as
+// its own button, not a modifier on WheelUp/Down -- same escape valve
+// as the H/L keys, just via the mouse.
+func TestTreeViewMouseWheelScrollsHorizontally(t *testing.T) {
+	longID := "abcdefghijklmnopqrstuvwxyz0123456789"
+	tv := NewTreeView(testRenderer{})
+	tv.SetTree([]Node{{ID: longID, Height: 1, Payload: testItem{longID}}})
+	m, _ := tv.Update(tea.WindowSizeMsg{Width: 10, Height: 5})
+	*tv = m.(TreeView)
+
+	for i := 0; i < 30; i++ {
+		m, _ = tv.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelRight})
+		*tv = m.(TreeView)
+	}
+	scrolled := tv.View()
+	if !strings.Contains(scrolled, "0123456789") {
+		t.Fatalf("expected wheel-right to eventually reveal the rest of the row, got %q", scrolled)
+	}
+
+	for i := 0; i < 30; i++ {
+		m, _ = tv.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelLeft})
+		*tv = m.(TreeView)
+	}
+	back := tv.View()
+	if !strings.Contains(back, "abcdefgh") {
+		t.Fatalf("expected wheel-left to scroll back to the start, got %q", back)
+	}
+}
+
 func TestTreeViewSearchNarrowsToMatchingTopLevelNodes(t *testing.T) {
 	tv := newTestTreeView(40, 10)
 	sendKey(tv, "/")
