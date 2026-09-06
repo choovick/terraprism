@@ -302,3 +302,54 @@ func TestTreeViewGGTopAndShiftGBottom(t *testing.T) {
 		t.Fatalf("expected 'gg' to jump to the first row (alpha), got %q", id)
 	}
 }
+
+// H/L scroll the viewport sideways -- capitalized since h/l (and the
+// arrow keys) are already taken by collapse/expand. This is the only
+// way to read a row wider than the viewport that a RowRenderer never
+// word-wraps, e.g. one long, unbroken address/ID.
+func TestTreeViewHorizontalScrollRevealsLongRow(t *testing.T) {
+	longID := "abcdefghijklmnopqrstuvwxyz0123456789"
+	tv := NewTreeView(testRenderer{})
+	tv.SetTree([]Node{{ID: longID, Height: 1, Payload: testItem{longID}}})
+	m, _ := tv.Update(tea.WindowSizeMsg{Width: 10, Height: 5})
+	*tv = m.(TreeView)
+
+	initial := tv.View()
+	if !strings.Contains(initial, "abcdefgh") {
+		t.Fatalf("expected the start of the long row visible initially, got %q", initial)
+	}
+	if strings.Contains(initial, "0123456789") {
+		t.Fatalf("expected the tail of the long row clipped off-screen initially, got %q", initial)
+	}
+
+	for i := 0; i < 30; i++ {
+		sendKey(tv, "L")
+	}
+	scrolled := tv.View()
+	if !strings.Contains(scrolled, "0123456789") {
+		t.Fatalf("expected 'L' to eventually reveal the rest of the row, got %q", scrolled)
+	}
+
+	for i := 0; i < 30; i++ {
+		sendKey(tv, "H")
+	}
+	back := tv.View()
+	if !strings.Contains(back, "abcdefgh") {
+		t.Fatalf("expected 'H' to scroll back to the start, got %q", back)
+	}
+}
+
+// Regression guard: 'h'/'l' (lowercase) and the arrow keys must keep
+// their existing collapse/expand meaning, not be reinterpreted as
+// horizontal scroll now that H/L exist.
+func TestTreeViewLowercaseHLStillCollapseExpand(t *testing.T) {
+	tv := newTestTreeView(40, 10)
+	sendKey(tv, "l") // expand alpha (already expanded by default; no-op either way)
+	if strings.Contains(tv.View(), "alpha.1") == false {
+		t.Fatalf("expected alpha.1 still visible after 'l', got:\n%s", tv.View())
+	}
+	sendKey(tv, "h")
+	if strings.Contains(tv.View(), "alpha.1") {
+		t.Fatalf("expected 'h' to collapse alpha (hiding alpha.1), got:\n%s", tv.View())
+	}
+}

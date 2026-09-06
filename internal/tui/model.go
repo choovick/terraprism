@@ -1807,7 +1807,7 @@ func (m Model) viewHelpFooter() string {
 	}
 
 	helpOptions := []string{
-		"j/k/↑↓: navigate • l/→: expand • h/←/⌫: collapse • e/c: scope • E/C: all • +/-: diff context • Ctrl+E/Y: line scroll • d/u: page scroll • gg/G: top/bottom • /: search • f: filter • s: sort • " + sensitiveHint + " • q: quit",
+		"j/k/↑↓: navigate • l/→: expand • h/←/⌫: collapse • e/c: scope • E/C: all • +/-: diff context • Ctrl+E/Y: line scroll • H/L: sideways • d/u: page scroll • gg/G: top/bottom • /: search • f: filter • s: sort • " + sensitiveHint + " • q: quit",
 		"j/k: nav • l/h: fold • e/c: scope • E/C: all • +/-: diff ctx • Ctrl+E/Y: line • d/u: page • /: search • f/s • q",
 		"j/k nav • l/h fold • e/c scope • E/C all • +/- diff • Ctrl+E/Y scroll • / search • q",
 		"j/k nav • l/h fold • e/c • q",

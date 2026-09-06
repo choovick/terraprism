@@ -145,8 +145,12 @@ terraform show -json plan.bin | terraprism -p
 | `u` / `Ctrl+U` | Scroll half page up |
 | `Ctrl+E` | Scroll one line down |
 | `Ctrl+Y` | Scroll one line up |
+| `H` | Scroll sideways left |
+| `L` | Scroll sideways right |
 | `+` / `=` | Show more unchanged context around diff hunks |
 | `-` | Show less unchanged context around diff hunks |
+
+Some lines are deliberately never word-wrapped (an `old → new` update diff, or a resource's own address line) — use `H`/`L` (capitalized, since `h`/`l` already collapse/expand) to scroll sideways and read the rest.
 
 ### Expand/Collapse
 | Key | Action |

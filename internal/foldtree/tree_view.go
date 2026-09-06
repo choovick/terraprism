@@ -53,6 +53,13 @@ type Searchable interface {
 // search box. State() is an escape hatch for a host that needs to
 // trigger tree-shape operations (ExpandSubtree, SetCollapsed, ...) from
 // its own domain-specific key bindings.
+//
+// H/L scroll the viewport sideways -- the capital letters, since h/l
+// (and the arrow keys) already collapse/expand the selected node. This
+// is the only way to read a row a RowRenderer deliberately never
+// word-wraps (e.g. a long update's old->new diff, or a row's own
+// address line), the same escape valve LogPane offers for its own
+// unwrappable content.
 type TreeView struct {
 	nav          State
 	renderer     RowRenderer
@@ -196,6 +203,16 @@ func (t TreeView) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if id, ok := t.nav.SelectedID(); ok {
 			t.nav.SetCollapsed(id, false)
 		}
+	case "H":
+		// Capitalized, not h/left, since those already collapse the
+		// selected node -- rows this needs to reach (a long update's
+		// old->new diff, a resource's own address line) are deliberately
+		// never word-wrapped, so this is the only way to read the rest.
+		t.viewport.ScrollLeft(horizontalScrollStep)
+		return t, nil
+	case "L":
+		t.viewport.ScrollRight(horizontalScrollStep)
+		return t, nil
 	case "d", "ctrl+d":
 		t.nav.MoveMouse(t.viewport.Height / 2)
 	case "u", "ctrl+u":
