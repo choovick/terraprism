@@ -48,6 +48,19 @@ func TestDecode(t *testing.T) {
 				if p.OutputCount != 1 {
 					t.Errorf("OutputCount = %d, want 1", p.OutputCount)
 				}
+				// Regression: id/arn are in after_unknown but never in
+				// before or after (Terraform omits an unknown value from
+				// "after" entirely), so they used to be invisible to
+				// unionKeys and silently vanish from the whole tree.
+				for _, name := range []string{"id", "arn"} {
+					attr := findAttr(t, r.Attributes, name)
+					if attr.Action != ActionCreate {
+						t.Errorf("%s.Action = %s, want create", name, attr.Action)
+					}
+					if !attr.Computed {
+						t.Errorf("%s.Computed = false, want true (known after apply)", name)
+					}
+				}
 				// Regression: the output's own attribute Action must stay
 				// the real create/update/delete value (here: create, since
 				// before is absent and after is unknown) rather than being
@@ -359,6 +372,63 @@ func TestSensitiveWholeSubtreeCarriesRealValue(t *testing.T) {
 	}
 	if !reflect.DeepEqual(creds.New, wantNew) {
 		t.Errorf("credentials.New = %#v, want %#v", creds.New, wantNew)
+	}
+}
+
+// Regression for a real bug: a map key that's brand new *and* not known
+// until apply (e.g. an ARN derived from a resource being created in the
+// same plan) is absent from both "before" (genuinely new) and "after"
+// (Terraform omits an unknown value from "after" entirely) -- present
+// only in the parallel after_unknown structure. unionKeys used to only
+// look at before/after, so such a key was never discovered at all and
+// silently vanished from the whole tree instead of showing up as
+// "(known after apply)", alongside ordinary sibling keys that were
+// either updated or genuinely untouched.
+func TestNewUnknownMapKeyIsNotDroppedFromTree(t *testing.T) {
+	raw := []byte(`{
+		"format_version": "1.2",
+		"resource_changes": [{
+			"address": "aws_iam_role.example",
+			"mode": "managed",
+			"type": "aws_iam_role",
+			"name": "example",
+			"change": {
+				"actions": ["update"],
+				"before": {"config": {"existing_key": "old", "unchanged_key": "same"}},
+				"after": {"config": {"existing_key": "new", "unchanged_key": "same"}},
+				"after_unknown": {"config": {"new_unknown_key": true}},
+				"before_sensitive": {},
+				"after_sensitive": {}
+			}
+		}],
+		"output_changes": {}
+	}`)
+
+	p, err := DecodeBytes(raw)
+	if err != nil {
+		t.Fatalf("DecodeBytes: %v", err)
+	}
+	if len(p.Resources) != 1 {
+		t.Fatalf("got %d resources, want 1", len(p.Resources))
+	}
+
+	config := findAttr(t, p.Resources[0].Attributes, "config")
+	newKey := findAttr(t, config.Children, "new_unknown_key")
+	if newKey.Action != ActionCreate {
+		t.Errorf("new_unknown_key.Action = %s, want create", newKey.Action)
+	}
+	if !newKey.Computed {
+		t.Errorf("new_unknown_key.Computed = false, want true (known after apply)")
+	}
+
+	// Sibling keys must be unaffected by the fix.
+	existing := findAttr(t, config.Children, "existing_key")
+	if existing.Action != ActionUpdate || existing.Old != "old" || existing.New != "new" {
+		t.Errorf("existing_key = %+v, want an update from \"old\" to \"new\"", existing)
+	}
+	unchanged := findAttr(t, config.Children, "unchanged_key")
+	if unchanged.Action != ActionNoOp {
+		t.Errorf("unchanged_key.Action = %s, want no-op", unchanged.Action)
 	}
 }
 

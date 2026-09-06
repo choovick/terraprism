@@ -82,7 +82,7 @@ func convertResourceChange(rc *tfjson.ResourceChange) *Resource {
 	beforeSensMap := asMap(ch.BeforeSensitive)
 	afterSensMap := asMap(ch.AfterSensitive)
 
-	keys := unionKeys(beforeMap, afterMap)
+	keys := unionKeys(beforeMap, afterMap, unknownMap)
 	attrs := make([]Attribute, 0, len(keys))
 	for _, k := range keys {
 		bv, bExists := beforeMap[k]

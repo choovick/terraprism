@@ -73,7 +73,7 @@ func buildMapAttribute(name, path string, before, after any, beforeExists, after
 	beforeSensMap := asMap(beforeSensitive)
 	afterSensMap := asMap(afterSensitive)
 
-	keys := unionKeys(beforeMap, afterMap)
+	keys := unionKeys(beforeMap, afterMap, unknownMap)
 	children := make([]Attribute, 0, len(keys))
 	for _, k := range keys {
 		childPath := path + "." + k
@@ -158,24 +158,31 @@ func buildListAttribute(name, path string, before, after any, beforeExists, afte
 // diffAction derives a leaf node's action from presence/absence on each
 // side (not nil-ness of the decoded value, which can't distinguish an
 // explicit JSON null from a genuinely absent key) and, when present on
-// both sides, direct value comparison. Existence is checked before the
-// unknown flag for the create case: a newly-created attribute whose
-// value happens to be unknown is still a create (rendered as "(known
-// after apply)" via the separate Computed flag), not an "update" showing
-// a confusing "null → (known after apply)" arrow. But an attribute that
-// existed before and has become wholly unknown is still an update, even
-// though Terraform's plan JSON omits it from "after" entirely (the same
-// encoding it uses for "genuinely deleted") -- unknown is checked before
-// treating a missing "after" as a delete, specifically for that case.
+// both sides, direct value comparison.
+//
+// !beforeExists resolves to create unconditionally (regardless of
+// afterExists) rather than only when afterExists is also true: a
+// brand-new attribute whose value isn't known until apply is omitted
+// from "after" entirely, the very same encoding Terraform uses for an
+// attribute that existed before and became wholly unknown (handled by
+// the beforeExists && !afterExists && unknown case below) -- so
+// !beforeExists && !afterExists is ambiguous between "never existed
+// either side" (no-op) and "brand new, value not known yet" (create),
+// and only the unknown flag can tell them apart. Checking !beforeExists
+// before consulting unknown at all would misroute the create case into
+// looking like a no-op otherwise, which is exactly what used to happen
+// here (a real bug: a newly-created attribute like `id` or `arn` on a
+// fresh resource would silently vanish from the tree instead of showing
+// "(known after apply)").
 func diffAction(before, after any, beforeExists, afterExists, unknown bool) Action {
 	switch {
-	case !beforeExists && !afterExists:
+	case !beforeExists && !afterExists && !unknown:
 		return ActionNoOp
-	case !beforeExists && afterExists:
+	case !beforeExists:
 		return ActionCreate
-	case beforeExists && !afterExists && unknown:
+	case !afterExists && unknown:
 		return ActionUpdate
-	case beforeExists && !afterExists:
+	case !afterExists:
 		return ActionDelete
 	case unknown:
 		return ActionUpdate
@@ -191,13 +198,13 @@ func diffAction(before, after any, beforeExists, afterExists, unknown bool) Acti
 // that priority order, for the same reason as diffAction.
 func aggregateAction(children []Attribute, beforeExists, afterExists bool, unknown bool) Action {
 	switch {
-	case !beforeExists && !afterExists:
+	case !beforeExists && !afterExists && !unknown:
 		return ActionNoOp
-	case !beforeExists && afterExists:
+	case !beforeExists:
 		return ActionCreate
-	case beforeExists && !afterExists && unknown:
+	case !afterExists && unknown:
 		return ActionUpdate
-	case beforeExists && !afterExists:
+	case !afterExists:
 		return ActionDelete
 	case unknown:
 		return ActionUpdate
@@ -253,23 +260,28 @@ func asList(v any) []interface{} {
 	return l
 }
 
-// unionKeys returns the sorted union of keys present in either map.
-// Terraform's own CLI plan renderer sorts map-attribute keys
-// alphabetically, so this matches existing UX rather than deviating
-// from it.
-func unionKeys(a, b map[string]interface{}) []string {
-	seen := make(map[string]struct{}, len(a)+len(b))
-	keys := make([]string, 0, len(a)+len(b))
-	for k := range a {
-		if _, ok := seen[k]; !ok {
-			seen[k] = struct{}{}
-			keys = append(keys, k)
-		}
-	}
-	for k := range b {
-		if _, ok := seen[k]; !ok {
-			seen[k] = struct{}{}
-			keys = append(keys, k)
+// unionKeys returns the sorted union of keys present in any of the given
+// maps. Terraform's own CLI plan renderer sorts map-attribute keys
+// alphabetically, so this matches existing UX rather than deviating from
+// it.
+//
+// Every caller must pass the unknown map (after_unknown) alongside
+// before/after, not just those two: a value that isn't known until
+// apply is omitted from "after" entirely -- the same encoding Terraform
+// uses for a value that existed before and became wholly unknown (see
+// diffAction) -- so a brand-new, still-unknown attribute is present in
+// neither before nor after, only in this parallel structure. Without
+// including it here, such an attribute is never discovered at all: not
+// mis-rendered, just completely absent from the whole tree.
+func unionKeys(maps ...map[string]interface{}) []string {
+	seen := make(map[string]struct{})
+	var keys []string
+	for _, m := range maps {
+		for k := range m {
+			if _, ok := seen[k]; !ok {
+				seen[k] = struct{}{}
+				keys = append(keys, k)
+			}
 		}
 	}
 	sort.Strings(keys)
